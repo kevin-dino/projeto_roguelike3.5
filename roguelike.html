@@ -1,0 +1,2546 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meu Roguelike</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0d0b12; color: #b8aebf;
+    font-family: monospace; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  canvas { width: min(100vw, 150vh); height: auto; aspect-ratio: 3 / 2; display: block;
+    image-rendering: pixelated; background: #191622; outline: none; }
+  #help { font-size: 12px; padding: 6px 10px; text-align: center; line-height: 1.5; }
+  #help b { color: #f6c95b; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="640" tabindex="0"></canvas>
+<div id="help">
+  <b>WASD</b> move &middot; <b>Setas</b> atiram (Brimstone / Tech X: segure e solte) &middot;
+  <b>E / Espaço</b> bomba &middot; <b>Q / Shift</b> item ativo &middot; <b>TAB</b> status &middot;
+  <b>P / Esc</b> pausa &middot; segure <b>R</b> para reiniciar
+</div>
+<script>
+"use strict";
+// Meu Roguelike - versao HTML (porta do prototipo em pygame, versao 7)
+//
+// CONTROLES
+//   WASD ........ movimenta          Setas ....... atiram
+//   E / ESPACO .. coloca bomba       Q / SHIFT ... usa o item ativo
+//   P / ESC ..... pausa (ou botao de pausa no topo)
+//   TAB ......... abre/fecha o painel de STATUS (ou clique na aba do canto esquerdo)
+//   Segurar R ... reinicia o jogo apos 1 segundo
+//
+// ARMAS ESPECIAIS (substituem a lagrima) - ambas carregam: segure o tiro e solte.
+//   BRIMSTONE: laser de sangue. Tiro duplo/triplo = lasers paralelos em linha reta.
+//   TECH X:    anel de laser que fere quem toca a borda.
+//   Os dois aceitam efeitos: gelo/fogo/veneno aplicam status, teleguiado curva o laser /
+//   guia o anel e saltitante faz ricochetear nas paredes.
+
+const canvas = document.getElementById("game");
+const ctx0 = canvas.getContext("2d");
+let g = ctx0;
+
+const WIDTH = 960, HEIGHT = 640, FPS = 60, SCALE = 2;
+const VW = WIDTH / SCALE, VH = HEIGHT / SCALE;
+const PI2 = Math.PI * 2;
+
+const F_SMALL = "bold 9px monospace";
+const F_HINT = "bold 11px monospace";
+const F_BIG = "bold 22px monospace";
+
+// ----------------------------------------------------------------------------
+// Utilidades (random, retangulos, desenho)
+// ----------------------------------------------------------------------------
+const rand = Math.random;
+const ri = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+const uniform = (a, b) => a + Math.random() * (b - a);
+const choice = (arr) => arr[Math.floor(Math.random() * arr.length)];
+function sample(arr, k) {
+  const c = arr.slice(), out = [];
+  while (out.length < k && c.length) out.push(c.splice(Math.floor(Math.random() * c.length), 1)[0]);
+  return out;
+}
+function choices(items, weights) {
+  const total = weights.reduce((a, b) => a + b, 0);
+  let r = Math.random() * total;
+  for (let i = 0; i < items.length; i++) { r -= weights[i]; if (r < 0) return items[i]; }
+  return items[items.length - 1];
+}
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const mix = (c1, c2, t) => c1.map((a, i) => Math.trunc(a + (c2[i] - a) * t));
+const ck = (x, y) => x + "," + y;
+const P = (k) => k.split(",").map(Number);
+
+class Rect {
+  constructor(x, y, w, h) { this.x = x; this.y = y; this.w = w; this.h = h; }
+  get left() { return this.x; }
+  get right() { return this.x + this.w; }
+  get top() { return this.y; }
+  get bottom() { return this.y + this.h; }
+  get centerx() { return this.x + this.w / 2; }
+  get centery() { return this.y + this.h / 2; }
+  get center() { return [this.centerx, this.centery]; }
+  get topleft() { return [this.x, this.y]; }
+  get topright() { return [this.x + this.w, this.y]; }
+  get bottomleft() { return [this.x, this.y + this.h]; }
+  get bottomright() { return [this.x + this.w, this.y + this.h]; }
+  colliderect(o) { return this.x < o.x + o.w && o.x < this.x + this.w && this.y < o.y + o.h && o.y < this.y + this.h; }
+  collidepoint(px, py) { return px >= this.x && px < this.x + this.w && py >= this.y && py < this.y + this.h; }
+  inflate(dx, dy) { return new Rect(this.x - dx / 2, this.y - dy / 2, this.w + dx, this.h + dy); }
+  move(dx, dy) { return new Rect(this.x + dx, this.y + dy, this.w, this.h); }
+  clipline(a, b) {  // Liang-Barsky: o segmento toca o retangulo?
+    let t0 = 0, t1 = 1;
+    const dx = b[0] - a[0], dy = b[1] - a[1];
+    const p = [-dx, dx, -dy, dy];
+    const q = [a[0] - this.x, this.x + this.w - a[0], a[1] - this.y, this.y + this.h - a[1]];
+    for (let i = 0; i < 4; i++) {
+      if (p[i] === 0) { if (q[i] < 0) return false; }
+      else {
+        const t = q[i] / p[i];
+        if (p[i] < 0) { if (t > t1) return false; if (t > t0) t0 = t; }
+        else { if (t < t0) return false; if (t < t1) t1 = t; }
+      }
+    }
+    return true;
+  }
+}
+
+const col = (c, a) => a === undefined
+  ? `rgb(${c[0] | 0},${c[1] | 0},${c[2] | 0})`
+  : `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+function frect(c, x, y, w, h) { g.fillStyle = col(c); g.fillRect(x, y, w, h); }
+function falpha(c, a, x, y, w, h) { g.fillStyle = col(c, a); g.fillRect(x, y, w, h); }
+function orect(c, x, y, w, h, lw = 1) {
+  g.strokeStyle = col(c); g.lineWidth = lw; g.strokeRect(x + lw / 2, y + lw / 2, w - lw, h - lw);
+}
+function fcirc(c, x, y, r) {
+  g.fillStyle = col(c); g.beginPath(); g.arc(x, y, Math.max(r, 0), 0, PI2); g.fill();
+}
+function ocirc(c, x, y, r, lw = 1) {
+  g.strokeStyle = col(c); g.lineWidth = lw; g.beginPath();
+  g.arc(x, y, Math.max(r - lw / 2, 0), 0, PI2); g.stroke();
+}
+function fell(c, x, y, w, h) {
+  g.fillStyle = col(c); g.beginPath();
+  g.ellipse(x + w / 2, y + h / 2, Math.max(w / 2, 0), Math.max(h / 2, 0), 0, 0, PI2); g.fill();
+}
+function fpoly(c, pts) {
+  g.fillStyle = col(c); g.beginPath(); g.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) g.lineTo(pts[i][0], pts[i][1]);
+  g.closePath(); g.fill();
+}
+function line(c, a, b, lw = 1) {
+  g.strokeStyle = col(c); g.lineWidth = lw; g.lineCap = "butt";
+  g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke();
+}
+function lines(c, pts, lw = 1) {
+  g.strokeStyle = col(c); g.lineWidth = lw; g.lineCap = "round"; g.lineJoin = "round";
+  g.beginPath(); g.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) g.lineTo(pts[i][0], pts[i][1]);
+  g.stroke(); g.lineCap = "butt";
+}
+function T(s, font, c, x, y, mode = "tl") {
+  g.font = font; g.fillStyle = col(c);
+  g.textBaseline = mode === "c" ? "middle" : "top";
+  g.textAlign = (mode === "c" || mode === "tc") ? "center" : (mode === "tr" ? "right" : "left");
+  g.fillText(s, x, y);
+}
+function tw(s, font) { g.font = font; return g.measureText(s).width; }
+
+// ----------------------------------------------------------------------------
+// Constantes
+// ----------------------------------------------------------------------------
+const COLORS = {
+  background: [25, 22, 34], floor: [54, 47, 61], floor_alt: [58, 50, 65],
+  floor_secret: [46, 40, 72], floor_super: [68, 40, 62], floor_boss: [62, 44, 52],
+  floor_treasure: [66, 58, 44], floor_devil: [66, 28, 36], floor_angel: [70, 76, 100],
+  floor_shop: [44, 66, 52], shadow: [40, 35, 48], wall: [26, 24, 34], wall_edge: [104, 83, 103],
+  secret_edge: [190, 120, 255], devil_edge: [210, 50, 62], angel_edge: [225, 232, 255],
+  shop_edge: [110, 220, 130], player: [90, 174, 235], player_light: [183, 229, 255],
+  enemy: [185, 75, 91], enemy_light: [255, 151, 145], tear: [115, 220, 255], bullet: [255, 120, 110],
+  white: [245, 239, 225], red: [220, 66, 83], dark_red: [86, 34, 49], gold: [246, 201, 91],
+  rock: [78, 70, 86], rock_light: [112, 102, 120], rock_dark: [44, 39, 52],
+  door_closed: [96, 58, 66], door_bar: [50, 30, 38], door_open: [12, 10, 18],
+  door_locked: [200, 160, 60], door_devil: [190, 36, 48], door_angel: [225, 232, 255],
+  door_shop: [90, 200, 110], chest: [128, 82, 46], chest_light: [166, 112, 64], chest_dark: [70, 44, 26],
+  gold_chest: [214, 164, 52], gold_chest_light: [255, 226, 130], bomb: [36, 34, 44],
+  bomb_light: [100, 98, 120], fuse: [255, 170, 70], panel: [10, 8, 15], grey: [130, 120, 140],
+  dim: [62, 56, 72],
+};
+
+const ROOM = new Rect(25, 25, VW - 50, VH - 50);
+const PLAYER_SIZE = 13, PLAYER_SPEED = 2.25, PLAYER_MAX_HP = 6;
+const TEAR_SPEED = 5.0, TEAR_COOLDOWN = 13, TEAR_LIFE = 105;
+const INVULN_FRAMES = 51, DOOR_W = 24, BOMB_RADIUS = 36, BOMB_FUSE = 75;
+const RESTART_HOLD_MS = 1000, MIN_MAX_HP = 2;
+
+const DIRECTIONS = { N: [0, -1], S: [0, 1], E: [1, 0], W: [-1, 0] };
+const OPPOSITE = { N: "S", S: "N", E: "W", W: "E" };
+const DIR_BY_VECTOR = {};
+for (const [k, v] of Object.entries(DIRECTIONS)) DIR_BY_VECTOR[v[0] + "," + v[1]] = k;
+
+// ----------------------------------------------------------------------------
+// Inimigos
+// ----------------------------------------------------------------------------
+const ENEMY_SPECS = {};
+function E(id, name, health, speed, damage, size, flying, move, attacks, death, passive, shape,
+           color, light, weight, min_floor) {
+  ENEMY_SPECS[id] = { id, name, health, speed, damage, size, flying, move, attacks, death, passive,
+                      shape, color, light, weight, min_floor };
+}
+E("fly", "Mosca", 2, 1.05, 1, 10, true, "chase", [], [], [], "fly", [120, 140, 80], [205, 225, 245], 4, 1);
+E("chaser", "Perseguidor", 3, 0.72, 1, 13, false, "chase", [], [], [], "box", [185, 75, 91], [255, 151, 145], 4, 1);
+E("tank", "Tanque", 8, 0.40, 2, 18, false, "chase", [], [], [], "tank", [110, 72, 140], [166, 128, 196], 1, 1);
+E("shooter", "Atirador", 3, 0.55, 1, 13, false, "kite", ["shoot"], [], [], "cannon", [80, 150, 170], [160, 220, 230], 3, 1);
+E("dasher", "Investida", 3, 0.60, 1, 13, false, "dash", [], [], [], "horn", [200, 120, 60], [250, 190, 120], 3, 1);
+E("wasp", "Vespa", 2, 0.90, 1, 10, true, "orbit", ["shoot"], [], [], "fly", [230, 190, 40], [255, 240, 170], 2, 2);
+E("bomber", "Bombardeiro", 2, 1.00, 1, 12, false, "chase", [], ["explode"], [], "round", [230, 100, 40], [255, 190, 110], 2, 2);
+E("slime", "Gosma", 4, 0.50, 1, 14, false, "chase", [], ["split"], [], "round", [90, 190, 110], [170, 240, 170], 2, 2);
+E("turret", "Torreta", 6, 0.0, 1, 14, false, "static", ["ring"], [], [], "turret", [110, 110, 130], [170, 170, 190], 1, 3);
+E("mage", "Mago", 4, 0.50, 1, 14, false, "kite", ["spread"], [], ["teleport"], "mage", [120, 90, 200], [190, 160, 255], 2, 4);
+// FASE 2: CAVERNAS
+E("bat", "Morcego", 3, 0.95, 1, 10, true, "dash", [], [], [], "fly", [150, 90, 170], [220, 180, 235], 3, 3);
+E("spider", "Aranha", 4, 0.85, 1, 13, false, "orbit", ["spread"], [], [], "spider", [100, 64, 52], [170, 120, 96], 3, 3);
+// FASE 3: CATACUMBAS
+E("skeleton", "Esqueleto", 5, 0.60, 1, 13, false, "chase", ["shoot"], [], [], "skull", [220, 214, 196], [255, 252, 236], 3, 5);
+E("ghost", "Fantasma", 4, 0.70, 1, 12, true, "chase", [], [], ["teleport"], "ghost", [190, 210, 240], [240, 248, 255], 3, 5);
+// FASE 4: VULCAO
+E("magma", "Magma", 8, 0.40, 1, 17, false, "chase", ["ring"], ["split"], [], "round", [240, 90, 30], [255, 200, 90], 2, 7);
+E("imp", "Diabrete", 4, 1.00, 1, 11, true, "orbit", ["spread"], [], ["teleport"], "flame", [230, 60, 40], [255, 190, 90], 3, 7);
+// FASE 5: GELEIRA
+E("yeti", "Yeti", 12, 0.50, 2, 18, false, "chase", ["ring"], [], [], "tank", [200, 228, 248], [240, 250, 255], 1, 9);
+E("crystal", "Cristal", 8, 0.0, 1, 14, false, "static", ["spread", "ring"], [], [], "crystal", [130, 220, 250], [220, 250, 255], 2, 9);
+// FASE 6: CRIPTA SOMBRIA
+E("reaper", "Ceifador", 8, 0.80, 2, 14, false, "dash", [], [], ["teleport"], "ghost", [70, 50, 110], [160, 120, 220], 2, 11);
+E("hydra", "Hidra", 10, 0.50, 1, 16, false, "chase", ["shoot", "ring"], [], ["regen"], "round", [60, 150, 110], [130, 230, 170], 1, 11);
+
+const STAGES = [
+  { name: "PORAO", bg: [25, 22, 34], floor: [54, 47, 61], edge: [104, 83, 103], rock: [78, 70, 86], rock_light: [112, 102, 120], rock_dark: [44, 39, 52], enemies: [] },
+  { name: "CAVERNAS", bg: [18, 24, 22], floor: [52, 58, 48], edge: [112, 124, 86], rock: [86, 90, 72], rock_light: [124, 130, 102], rock_dark: [44, 50, 40], enemies: ["bat", "spider"] },
+  { name: "CATACUMBAS", bg: [28, 26, 30], floor: [66, 62, 58], edge: [156, 144, 120], rock: [104, 98, 90], rock_light: [150, 142, 128], rock_dark: [58, 54, 50], enemies: ["skeleton", "ghost"] },
+  { name: "VULCAO", bg: [34, 16, 14], floor: [76, 40, 34], edge: [222, 110, 50], rock: [100, 52, 42], rock_light: [164, 86, 60], rock_dark: [54, 26, 22], enemies: ["magma", "imp"] },
+  { name: "GELEIRA", bg: [18, 26, 40], floor: [70, 92, 112], edge: [170, 220, 245], rock: [110, 140, 168], rock_light: [180, 214, 238], rock_dark: [62, 84, 108], enemies: ["yeti", "crystal"] },
+  { name: "CRIPTA SOMBRIA", bg: [12, 8, 18], floor: [38, 30, 50], edge: [150, 70, 200], rock: [60, 48, 74], rock_light: [102, 78, 130], rock_dark: [28, 20, 38], enemies: ["reaper", "hydra"] },
+];
+const ACTIVE_STAGE = Object.assign({}, STAGES[0]);
+
+function stage_for(floor) {
+  const index = Math.floor((floor - 1) / 2);
+  return [STAGES[index % STAGES.length], index + 1];
+}
+
+const MINI_SPEC = { id: "mini", name: "Filhote", health: 1, speed: 1.10, damage: 1, size: 8,
+  flying: false, move: "chase", attacks: [], death: [], passive: [], shape: "round",
+  color: [90, 190, 110], light: [170, 240, 170], weight: 0, min_floor: 99 };
+
+const MUTATIONS = {
+  fast: { name: "Veloz", color: [255, 225, 80] },
+  armored: { name: "Blindado", color: [150, 175, 210] },
+  explosive: { name: "Explosivo", color: [255, 140, 40] },
+  regen: { name: "Regenerador", color: [90, 225, 120] },
+  splitting: { name: "Mitose", color: [200, 110, 245] },
+  gunner: { name: "Pistoleiro", color: [255, 90, 120] },
+};
+const TRAIT_WORDS = { dash: "Investida", orbit: "Orbital", kite: "Franco", shoot: "Atirador",
+  spread: "Dispersor", ring: "Pulsar", regen: "Regenerante", teleport: "Fantasma",
+  explode: "Explosivo", split: "Mitotico" };
+const BODY_WORDS = ["Larva", "Golem", "Espectro", "Casulo", "Verme", "Sentinela"];
+
+function roll_mutations(floor) {
+  const chance = Math.min(0.6, 0.06 + 0.07 * (floor - 1));
+  if (rand() >= chance) return [];
+  const count = (floor >= 5 && rand() < 0.25) ? 2 : 1;
+  return sample(Object.keys(MUTATIONS), count);
+}
+
+function hsv(h, s, v) {
+  const i = Math.floor(h * 6), f = h * 6 - i;
+  const p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+  return [[v, t, p], [q, v, p], [p, v, t], [p, q, v], [t, p, v], [v, p, q]][i % 6];
+}
+
+function generate_custom_enemy(floor) {
+  const tier = Math.max(1, Math.floor(floor / 2));
+  const flying = rand() < 0.4;
+  const moves = flying ? ["orbit"] : ["dash", "orbit", "kite"];
+  const pool = [...moves.map(m => ["move", m]),
+    ...["shoot", "spread", "ring"].map(a => ["attacks", a]),
+    ...["regen", "teleport"].map(p => ["passive", p]),
+    ...["explode", "split"].map(d => ["death", d])];
+  const chosen = sample(pool, Math.min(pool.length, Math.min(4, 1 + tier)));
+  const spec = { move: "chase", attacks: [], death: [], passive: [] };
+  for (const [category, value] of chosen) {
+    if (category === "move") spec.move = value; else spec[category].push(value);
+  }
+  const traits = [...(spec.move !== "chase" ? [spec.move] : []), ...spec.attacks, ...spec.passive, ...spec.death];
+  const hue = rand();
+  const body = hsv(hue, 0.65, 0.85).map(c => Math.trunc(c * 255));
+  const light = hsv(hue, 0.30, 1.00).map(c => Math.trunc(c * 255));
+  const word = traits.length ? TRAIT_WORDS[traits[0]] : "Comum";
+  Object.assign(spec, {
+    id: "custom_" + floor, tier,
+    name: choice(BODY_WORDS) + " " + word,
+    desc: traits.map(t => TRAIT_WORDS[t].toLowerCase()).join(", "),
+    health: (3 + tier * 1.5) * (flying ? 0.7 : 1.0),
+    speed: uniform(0.55, 0.95) + (flying ? 0.25 : 0.0),
+    damage: 1 + (tier >= 3 ? 1 : 0),
+    size: flying ? ri(10, 12) : ri(12, 16),
+    flying,
+    shape: flying ? "fly" : choice(["box", "round", "horn", "cannon"]),
+    color: body, light, weight: 3 + tier, min_floor: 1,
+  });
+  return spec;
+}
+
+// ----------------------------------------------------------------------------
+// Melhorias
+// ----------------------------------------------------------------------------
+const FX_COLORS = {
+  fire: [255, 140, 50], ice: [190, 240, 255], poison: [120, 230, 90],
+  pierce: [255, 255, 150], homing: [255, 120, 220], bounce: [255, 200, 120],
+};
+
+const ITEMS = {
+  boots: { name: "BOTAS VELOZES", desc: "+ velocidade de movimento", glyph: "B", color: [90, 200, 120], stats: { speed: 0.5 } },
+  container: { name: "CONTEINER DE VIDA", desc: "+1 coracao e cura 1", glyph: "V", color: [220, 66, 83], stats: { max_hp: 2 }, heal: 2 },
+  lens: { name: "LENTE POTENTE", desc: "+ dano dos tiros", glyph: "D", color: [255, 140, 70], stats: { damage: 1 } },
+  trigger: { name: "GATILHO RAPIDO", desc: "+ cadencia de tiro", glyph: "G", color: [255, 230, 100], stats: { cooldown: -4 } },
+  double: { name: "TIRO DUPLO", desc: "dispara mais uma lagrima", glyph: "2", color: [115, 220, 255], stats: { shots: 1 } },
+  range: { name: "ALCANCE LONGO", desc: "+ alcance e velocidade do tiro", glyph: "A", color: [180, 150, 255], stats: { tear_life: 45, tear_speed: 1.0 } },
+  bombbag: { name: "MOCHILA DE BOMBAS", desc: "+3 bombas e bombas mais fortes", glyph: "M", color: [150, 150, 170], stats: { bombs: 3, bomb_damage: 2 } },
+  amulet: { name: "AMULETO", desc: "mais tempo invulneravel ao tomar dano", glyph: "U", color: [255, 255, 255], stats: { invuln_frames: 30 } },
+  goldheart: { name: "CORACAO DOURADO", desc: "+1 coracao e cura total", glyph: "C", color: [246, 201, 91], stats: { max_hp: 2 }, heal: 99 },
+  fire: { name: "TIROS DE FOGO", desc: "queima os inimigos com o tempo", glyph: "F", color: FX_COLORS.fire, stats: {}, fx: "fire" },
+  ice: { name: "TIROS DE GELO", desc: "deixa os inimigos lentos", glyph: "I", color: FX_COLORS.ice, stats: {}, fx: "ice" },
+  poison: { name: "TIROS VENENOSOS", desc: "envenena: dano longo e constante", glyph: "P", color: FX_COLORS.poison, stats: {}, fx: "poison" },
+  pierce: { name: "TIROS PERFURANTES", desc: "atravessam os inimigos", glyph: "X", color: FX_COLORS.pierce, stats: {}, fx: "pierce" },
+  homing: { name: "TIROS TELEGUIADOS", desc: "perseguem o inimigo mais proximo", glyph: "T", color: FX_COLORS.homing, stats: {}, fx: "homing" },
+  bounce: { name: "TIROS SALTITANTES", desc: "quicam nas paredes", glyph: "S", color: FX_COLORS.bounce, stats: {}, fx: "bounce" },
+  brimstone: { name: "BRIMSTONE", desc: "segure e solte: laser (aceita efeitos)", glyph: "Z", color: [170, 20, 30], stats: {}, weapon: "brimstone" },
+  techx: { name: "TECH X", desc: "segure e solte: anel (aceita efeitos)", glyph: "N", color: [90, 230, 255], stats: {}, weapon: "techx" },
+  polyphemus: { name: "POLIFEMO", desc: "tiros enormes e fortes, porem lentos", glyph: "J", color: [235, 225, 200], stats: { damage: 3, cooldown: 7 } },
+  sacredheart: { name: "SAGRADO CORACAO", desc: "+1 coracao, +dano, tiros teleguiados", glyph: "!", color: [255, 170, 190], stats: { max_hp: 2, damage: 2, tear_speed: -1.0 }, heal: 2, fx: "homing" },
+  shop_heart: { name: "CORACAO", desc: "recupera 1 coracao", glyph: "+", color: [220, 66, 83], stats: {}, shop_only: true, consumable: "heart" },
+  shop_bomb: { name: "BOMBAS x3", desc: "+3 bombas", glyph: "o", color: [150, 150, 170], stats: {}, shop_only: true, consumable: "bomb" },
+  shop_key: { name: "CHAVE", desc: "+1 chave", glyph: "k", color: [246, 201, 91], stats: {}, shop_only: true, consumable: "key" },
+  map: { name: "MAPA ANTIGO", desc: "revela o mapa e as salas secretas", glyph: "?", color: [200, 170, 120], stats: {}, flag: "map" },
+};
+
+const DEVIL_ITEMS = {
+  bloodlens: { name: "LENTE DE SANGUE", desc: "+2 de dano dos tiros", glyph: "L", color: [170, 30, 50], stats: { damage: 2 }, devil_only: true, cost: 2 },
+  hellfire: { name: "GATILHO INFERNAL", desc: "+1 dano e tiro muito mais rapido", glyph: "H", color: [255, 90, 40], stats: { damage: 1, cooldown: -5 }, devil_only: true, cost: 4 },
+  trident: { name: "TRIDENTE", desc: "tiro triplo em chamas", glyph: "Y", color: [200, 40, 40], stats: { shots: 2 }, fx: "fire", devil_only: true, cost: 4 },
+};
+
+const ACTIVES = {
+  bombbox: { name: "CAIXA DE BOMBAS", desc: "[Q] invoca bombas ao seu redor", glyph: "O", color: [150, 150, 170], stats: {}, active: true, charges: 3, effect: "bombs" },
+  masterkey: { name: "CHAVE MESTRA", desc: "[Q] abre portas e baus trancados", glyph: "K", color: [246, 201, 91], stats: {}, active: true, charges: 2, effect: "keys" },
+  fury: { name: "FURIA", desc: "[Q] dano x2 por 10 segundos", glyph: "R", color: [230, 70, 60], stats: {}, active: true, charges: 3, effect: "fury" },
+  shield: { name: "ESCUDO ARCANO", desc: "[Q] invulneravel por 5 segundos", glyph: "E", color: [140, 200, 255], stats: {}, active: true, charges: 4, effect: "shield" },
+  shockwave: { name: "ONDA DE CHOQUE", desc: "[Q] fere todos da sala e limpa balas", glyph: "W", color: [200, 160, 255], stats: {}, active: true, charges: 4, effect: "blast" },
+};
+Object.assign(ITEMS, DEVIL_ITEMS, ACTIVES);
+
+const ANGEL_POOL = ["homing", "goldheart", "container", "amulet", "ice", "range", "double", "pierce", "trigger", "lens"];
+const SPREADS = { 1: [0.0], 2: [-0.10, 0.10], 3: [-0.20, 0.0, 0.20] };
+// Brimstone: tiro duplo/triplo vira lasers PARALELOS (deslocamento lateral em pixels).
+const LASER_OFFSETS = { 1: [0.0], 2: [-5.0, 5.0], 3: [-10.0, 0.0, 10.0] };
+
+// ----------------------------------------------------------------------------
+// Geometria das salas
+// ----------------------------------------------------------------------------
+function circle_rect_collision(cx, cy, radius, rect) {
+  const closest_x = clamp(cx, rect.left, rect.right);
+  const closest_y = clamp(cy, rect.top, rect.bottom);
+  return (cx - closest_x) ** 2 + (cy - closest_y) ** 2 < radius ** 2;
+}
+
+function move_with_rocks(entity, dx, dy, rocks) {
+  entity.x += dx;
+  if (rocks.some(r => entity.rect.colliderect(r))) entity.x -= dx;
+  entity.y += dy;
+  if (rocks.some(r => entity.rect.colliderect(r))) entity.y -= dy;
+}
+
+function door_trigger(direction) {
+  const cx = ROOM.centerx, cy = ROOM.centery;
+  if (direction === "N") return new Rect(cx - DOOR_W / 2, ROOM.top, DOOR_W, 8);
+  if (direction === "S") return new Rect(cx - DOOR_W / 2, ROOM.bottom - 8, DOOR_W, 8);
+  if (direction === "W") return new Rect(ROOM.left, cy - DOOR_W / 2, 8, DOOR_W);
+  return new Rect(ROOM.right - 8, cy - DOOR_W / 2, 8, DOOR_W);
+}
+
+function entry_position(direction) {
+  const cx = ROOM.centerx, cy = ROOM.centery;
+  if (direction === "N") return [cx, ROOM.bottom - 18];
+  if (direction === "S") return [cx, ROOM.top + 18];
+  if (direction === "E") return [ROOM.left + 18, cy];
+  return [ROOM.right - 18, cy];
+}
+
+const dist2 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+
+function find_free_spot(rocks, w, h, taken = []) {
+  const center = ROOM.center;
+  for (let i = 0; i < 80; i++) {
+    const x = ri(ROOM.left + 14, ROOM.right - 14 - w);
+    const y = ri(ROOM.top + 14, ROOM.bottom - 14 - h);
+    const rect = new Rect(x, y, w, h);
+    if (dist2(rect.center, center) < 45) continue;
+    if (Object.keys(DIRECTIONS).some(d => door_trigger(d).inflate(40, 40).colliderect(rect))) continue;
+    if ([...rocks, ...taken].some(o => rect.colliderect(o.inflate(10, 10)))) continue;
+    return rect;
+  }
+  return null;
+}
+
+function generate_dungeon(total_rooms = 9) {
+  const rooms = new Set(["0,0"]);
+  while (rooms.size < total_rooms) {
+    const cur = P(choice([...rooms]));
+    const [dx, dy] = choice(Object.values(DIRECTIONS));
+    const nx = cur[0] + dx, ny = cur[1] + dy;
+    if (Math.abs(nx) <= 3 && Math.abs(ny) <= 3) rooms.add(ck(nx, ny));
+  }
+  return rooms;
+}
+
+function get_neighbors(rooms, key) {
+  const [x, y] = P(key), out = {};
+  for (const [d, [dx, dy]] of Object.entries(DIRECTIONS)) {
+    const t = ck(x + dx, y + dy);
+    if (rooms.has(t)) out[d] = t;
+  }
+  return out;
+}
+
+function bfs_distances(layout) {
+  const dist = new Map([["0,0", 0]]);
+  const queue = ["0,0"];
+  while (queue.length) {
+    const cur = queue.shift();
+    for (const t of Object.values(get_neighbors(layout, cur))) {
+      if (!dist.has(t)) { dist.set(t, dist.get(cur) + 1); queue.push(t); }
+    }
+  }
+  return dist;
+}
+
+function make_rocks(count) {
+  const rocks = [], center = ROOM.center;
+  for (let i = 0; i < count; i++) {
+    for (let a = 0; a < 50; a++) {
+      const x = Math.floor(ri(ROOM.left + 10, ROOM.right - 26) / 8) * 8;
+      const y = Math.floor(ri(ROOM.top + 10, ROOM.bottom - 26) / 8) * 8;
+      const rect = new Rect(x, y, 16, 16);
+      if (dist2(rect.center, center) < 45) continue;
+      if (Object.keys(DIRECTIONS).some(d => door_trigger(d).inflate(40, 40).colliderect(rect))) continue;
+      if (rocks.some(o => rect.colliderect(o.inflate(8, 8)))) continue;
+      rocks.push(rect);
+      break;
+    }
+  }
+  return rocks;
+}
+
+// ----------------------------------------------------------------------------
+// Icones
+// ----------------------------------------------------------------------------
+function draw_key_icon(x, y) {
+  fcirc(COLORS.gold, x + 3, y + 4, 3);
+  frect(COLORS.gold, x + 5, y + 3, 6, 2);
+  frect(COLORS.gold, x + 9, y + 5, 2, 2);
+}
+function draw_bomb_icon(x, y, color) {
+  fcirc(color || COLORS.bomb_light, x + 4, y + 5, 4);
+  frect(COLORS.bomb, x + 2, y + 5, 5, 3);
+  frect(COLORS.fuse, x + 6, y - 1, 2, 3);
+}
+function draw_heart_icon(x, y) {
+  frect(COLORS.red, x, y, 8, 7);
+  frect(COLORS.white, x + 1, y + 1, 2, 2);
+}
+function draw_coin_icon(x, y) {
+  fcirc(COLORS.gold, x + 4, y + 4, 4);
+  fcirc([200, 150, 50], x + 4, y + 4, 2);
+  frect(COLORS.white, x + 2, y + 1, 2, 2);
+}
+
+// ----------------------------------------------------------------------------
+// Status (queimar, envenenar, congelar)
+// ----------------------------------------------------------------------------
+class Combatant {
+  init_status() { this.burn = 0; this.poison = 0; this.slow = 0; this.status_clock = 0; }
+  apply_fx(fx) {
+    if (fx.has("fire")) this.burn = 120;
+    if (fx.has("ice")) this.slow = 120;
+    if (fx.has("poison")) this.poison = 240;
+  }
+  get speed_mult() { return this.slow > 0 ? 0.5 : 1.0; }
+  tick_status() {
+    this.status_clock++;
+    let damage = 0.0;
+    if (this.burn > 0) { this.burn--; if (this.status_clock % 30 === 0) damage += 1.0; }
+    if (this.poison > 0) { this.poison--; if (this.status_clock % 20 === 0) damage += 0.5; }
+    if (this.slow > 0) this.slow--;
+    return damage;
+  }
+  status_color() {
+    if (this.burn > 0) return FX_COLORS.fire;
+    if (this.poison > 0) return FX_COLORS.poison;
+    if (this.slow > 0) return FX_COLORS.ice;
+    return null;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Projeteis, bombas e efeitos
+// ----------------------------------------------------------------------------
+class Tear {
+  constructor(x, y, dx, dy, damage, speed, life, fx = new Set()) {
+    this.x = x; this.y = y; this.dx = dx; this.dy = dy;
+    this.damage = damage; this.speed = speed; this.radius = 3; this.life = life;
+    this.fx = fx; this.hit = new Set(); this.bounces = 0;
+    const colors = [...fx].filter(f => f in FX_COLORS).map(f => FX_COLORS[f]);
+    this.color = colors.length
+      ? [0, 1, 2].map(i => Math.trunc(colors.reduce((s, c) => s + c[i], 0) / colors.length))
+      : COLORS.tear;
+  }
+  update(enemies) {
+    if (this.fx.has("homing") && enemies.length) {
+      let target = enemies[0], best = Infinity;
+      for (const e of enemies) {
+        const d = (e.x - this.x) ** 2 + (e.y - this.y) ** 2;
+        if (d < best) { best = d; target = e; }
+      }
+      const tx = target.x - this.x, ty = target.y - this.y;
+      const d = Math.hypot(tx, ty) || 1.0;
+      this.dx += tx / d * 0.14; this.dy += ty / d * 0.14;
+      const n = Math.hypot(this.dx, this.dy) || 1.0;
+      this.dx /= n; this.dy /= n;
+    }
+    this.x += this.dx * this.speed;
+    this.y += this.dy * this.speed;
+    this.life--;
+  }
+  draw() {
+    const x = Math.round(this.x), y = Math.round(this.y);
+    fcirc(this.color, x, y, this.radius);
+    frect(COLORS.white, x - 1, y - 2, 2, 2);
+  }
+}
+
+class Bullet {
+  constructor(x, y, vx, vy) { this.x = x; this.y = y; this.vx = vx; this.vy = vy; this.radius = 3; this.life = 260; }
+  update() { this.x += this.vx; this.y += this.vy; this.life--; }
+  draw() {
+    const x = Math.round(this.x), y = Math.round(this.y);
+    fcirc(COLORS.dark_red, x, y, this.radius + 1);
+    fcirc(COLORS.bullet, x, y, this.radius);
+    frect(COLORS.white, x - 1, y - 1, 2, 2);
+  }
+}
+
+function fire_ring(bullets, x, y, count, offset, speed) {
+  for (let i = 0; i < count; i++) {
+    const angle = offset + i * PI2 / count;
+    bullets.push(new Bullet(x, y, Math.cos(angle) * speed, Math.sin(angle) * speed));
+  }
+}
+
+class Bomb {
+  constructor(x, y) { this.x = x; this.y = y; this.fuse = BOMB_FUSE; }
+  draw() {
+    const x = Math.round(this.x), y = Math.round(this.y);
+    const lit = this.fuse < 30 && Math.floor(this.fuse / 4) % 2 === 0;
+    fcirc(lit ? COLORS.white : COLORS.bomb, x, y, 5);
+    fcirc(COLORS.bomb_light, x - 2, y - 2, 1);
+    frect(COLORS.fuse, x + 2, y - 8, 2, 4);
+  }
+}
+
+class Explosion {
+  constructor(x, y, radius = BOMB_RADIUS) { this.x = x; this.y = y; this.radius = radius; this.life = 20; this.LIFE = 20; }
+  draw() {
+    const progress = 1 - this.life / this.LIFE;
+    const radius = Math.trunc(this.radius * (0.4 + 0.6 * progress));
+    const x = Math.round(this.x), y = Math.round(this.y);
+    fcirc(COLORS.fuse, x, y, radius);
+    fcirc(COLORS.gold, x, y, Math.trunc(radius * 0.7));
+    if (this.life > this.LIFE / 2) fcirc(COLORS.white, x, y, Math.trunc(radius * 0.35));
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Armas especiais: laser do Brimstone e anel do Tech X
+// ----------------------------------------------------------------------------
+class Laser {
+  constructor(angle, damage, fx, offset = 0.0) {
+    this.angle = angle; this.damage = damage; this.fx = fx; this.offset = offset;
+    this.life = 26;
+    this.width = Math.trunc(clamp(3 + damage * 0.7, 4, 10));
+    this.points = [[0, 0], [0, 0]];
+    this.origin = [0, 0]; this.end = [0, 0];
+  }
+  // Teleguiado: curva rumo ao inimigo mais proximo da mira. Saltitante: reflete nas
+  // paredes (2x). Sem efeito: linha reta que para na parede.
+  refresh(ox, oy, enemies = []) {
+    let dx = Math.cos(this.angle), dy = Math.sin(this.angle);
+    let x = ox - dy * this.offset, y = oy + dx * this.offset;
+    const bounds = ROOM.inflate(-5, -5);
+    const homing = this.fx.has("homing");
+    let bounces_left = this.fx.has("bounce") ? 2 : 0;
+
+    let target = null;
+    if (homing) {
+      let best = null;
+      for (const e of enemies) {
+        let diff = Math.atan2(e.y - y, e.x - x) - this.angle;
+        diff = ((diff + Math.PI) % PI2 + PI2) % PI2 - Math.PI;
+        if (Math.abs(diff) < 1.3) {
+          const d = Math.hypot(e.x - x, e.y - y);
+          if (best === null || d < best) { best = d; target = e; }
+        }
+      }
+    }
+
+    const pts = [[x, y]];
+    for (let step = 0; step < 300; step++) {
+      if (target && Math.hypot(target.x - x, target.y - y) > 10) {
+        let cur = Math.atan2(dy, dx);
+        const want = Math.atan2(target.y - y, target.x - x);
+        const diff = (((want - cur + Math.PI) % PI2) + PI2) % PI2 - Math.PI;
+        cur += clamp(diff, -0.07, 0.07);
+        dx = Math.cos(cur); dy = Math.sin(cur);
+      }
+      const nx = x + dx * 4, ny = y + dy * 4;
+      if (!bounds.collidepoint(nx, ny)) {
+        if (bounces_left > 0) {
+          if (nx < bounds.left || nx > bounds.right) dx = -dx;
+          if (ny < bounds.top || ny > bounds.bottom) dy = -dy;
+          bounces_left--;
+          pts.push([x, y]);
+          continue;
+        }
+        break;
+      }
+      x = nx; y = ny;
+      if (homing && step % 3 === 0) pts.push([x, y]);
+    }
+    pts.push([x, y]);
+    this.points = pts.map(([px, py]) => [Math.round(px), Math.round(py)]);
+    this.origin = this.points[0];
+    this.end = this.points[this.points.length - 1];
+  }
+  segments() {
+    const out = [];
+    for (let i = 0; i < this.points.length - 1; i++) out.push([this.points[i], this.points[i + 1]]);
+    return out;
+  }
+  draw() {
+    const fade = Math.min(1.0, this.life / 8);
+    const w = Math.max(2, Math.trunc(this.width * fade));
+    if (this.points.length < 2) return;
+    lines(COLORS.dark_red, this.points, w + 2);
+    lines([220, 30, 40], this.points, w);
+    lines([255, 190, 170], this.points, Math.max(1, Math.floor(w / 3)));
+    fcirc([255, 120, 110], this.end[0], this.end[1], Math.floor(w / 2) + 2);
+  }
+}
+
+class TechRing {
+  constructor(x, y, dx, dy, damage, speed, life, fx, bonus = 0) {
+    this.x = x; this.y = y; this.dx = dx; this.dy = dy;
+    this.damage = damage; this.speed = speed; this.life = life; this.fx = fx;
+    this.radius = 13 + Math.min(8, Math.trunc(damage)) + bonus;
+    this.age = 0; this.bounces = 0;
+  }
+  update(enemies = []) {
+    if (this.fx.has("homing") && enemies.length) {
+      let target = enemies[0], best = Infinity;
+      for (const e of enemies) {
+        const d = (e.x - this.x) ** 2 + (e.y - this.y) ** 2;
+        if (d < best) { best = d; target = e; }
+      }
+      const tx = target.x - this.x, ty = target.y - this.y;
+      const d = Math.hypot(tx, ty) || 1.0;
+      this.dx += tx / d * 0.08; this.dy += ty / d * 0.08;
+      const n = Math.hypot(this.dx, this.dy) || 1.0;
+      this.dx /= n; this.dy /= n;
+    }
+    this.x += this.dx * this.speed;
+    this.y += this.dy * this.speed;
+    this.life--; this.age++;
+  }
+  // So fere na BORDA: inimigo pequeno totalmente dentro do anel nao e atingido.
+  hits(rect) {
+    const r = this.radius;
+    if (!circle_rect_collision(this.x, this.y, r + 2, rect)) return false;
+    const corners = [rect.topleft, rect.topright, rect.bottomleft, rect.bottomright];
+    const far = Math.max(...corners.map(([cx, cy]) => Math.hypot(cx - this.x, cy - this.y)));
+    return far >= r - 2;
+  }
+  draw() {
+    const x = Math.round(this.x), y = Math.round(this.y);
+    const pulse = Math.floor(this.age / 3) % 2;
+    ocirc([20, 60, 90], x, y, this.radius + 2, 3);
+    ocirc([90, 230, 255], x, y, this.radius, 2);
+    ocirc(COLORS.white, x, y, this.radius - 1 - pulse, 1);
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Objetos do chao
+// ----------------------------------------------------------------------------
+class Pickup {
+  constructor(x, y, kind) {
+    this.x = x; this.y = y; this.kind = kind;
+    this.rect = new Rect(Math.round(x) - 6, Math.round(y) - 6, 12, 12);
+  }
+  draw() {
+    const x = Math.round(this.x), y = Math.round(this.y);
+    fell(COLORS.shadow, x - 4, y + 4, 9, 3);
+    if (this.kind === "heart") draw_heart_icon(x - 4, y - 4);
+    else if (this.kind === "bomb") draw_bomb_icon(x - 4, y - 5);
+    else if (this.kind === "coin") {
+      const w = Math.trunc(Math.abs(Math.cos(performance.now() / 180)) * 3) + 1;
+      fell(COLORS.gold, x - w - 1, y - 4, w * 2 + 2, 8);
+      if (w >= 2) fell([200, 150, 50], x - w + 1, y - 2, Math.max(2, w * 2 - 2), 4);
+    } else draw_key_icon(x - 5, y - 4);
+  }
+}
+
+class Item {
+  constructor(x, y, item_id, cost = 0, group = null, price = 0) {
+    this.x = x; this.y = y; this.item_id = item_id; this.cost = cost; this.price = price;
+    this.group = group; this.armed = true; this.near = false;
+    this.rect = new Rect(Math.round(x) - 8, Math.round(y) - 8, 16, 16);
+  }
+  draw() {
+    const data = ITEMS[this.item_id];
+    const x = Math.round(this.x), y = Math.round(this.y);
+    const bob = Math.round(Math.sin(performance.now() / 220) * 2);
+    frect(COLORS.rock_dark, x - 9, y + 5, 18, 5);
+    frect(COLORS.rock, x - 8, y + 4, 16, 4);
+    frect(COLORS.panel, x - 7, y - 8 + bob, 14, 14);
+    frect(data.color, x - 6, y - 7 + bob, 12, 12);
+    if (data.active) orect(COLORS.gold, x - 8, y - 9 + bob, 16, 16, 1);
+    T(data.glyph, F_SMALL, COLORS.panel, x, y - 1 + bob, "c");
+
+    if (this.cost) {
+      draw_heart_icon(x - 9, y + 11);
+      T("-" + Math.floor(this.cost / 2), F_SMALL, COLORS.red, x + 1, y + 11);
+    }
+    if (this.price) {
+      draw_coin_icon(x - 11, y + 11);
+      T(String(this.price), F_SMALL, COLORS.gold, x - 1, y + 11);
+    }
+    if (this.near) {
+      const w = Math.max(tw(data.name, F_SMALL), tw(data.desc, F_SMALL)) + 8;
+      const cx = clamp(x, w / 2 + 4, VW - w / 2 - 4);
+      const top = y > 75 ? y - 40 : y + 24;
+      falpha(COLORS.panel, 200 / 255, cx - w / 2, top, w, 22);
+      T(data.name, F_SMALL, COLORS.gold, cx, top + 2, "tc");
+      T(data.desc, F_SMALL, COLORS.white, cx, top + 12, "tc");
+    }
+  }
+}
+
+class Chest {
+  constructor(x, y, kind) {
+    this.x = x; this.y = y; this.kind = kind; this.opened = false;
+    this.rect = new Rect(Math.round(x) - 8, Math.round(y) - 6, 16, 13);
+  }
+  draw() {
+    const x = Math.round(this.x), y = Math.round(this.y);
+    const gold = this.kind === "gold";
+    const body = gold ? COLORS.gold_chest : COLORS.chest;
+    const light = gold ? COLORS.gold_chest_light : COLORS.chest_light;
+    if (this.opened) {
+      frect(COLORS.chest_dark, x - 8, y - 2, 16, 9);
+      frect(COLORS.panel, x - 6, y - 1, 12, 3);
+      frect(light, x - 8, y - 8, 16, 4);
+    } else {
+      frect(body, x - 8, y - 5, 16, 12);
+      frect(light, x - 8, y - 6, 16, 5);
+      frect(gold ? COLORS.white : COLORS.gold, x - 1, y - 6, 2, 12);
+      frect(COLORS.panel, x - 2, y - 1, 4, 3);
+    }
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Inimigos
+// ----------------------------------------------------------------------------
+class Enemy extends Combatant {
+  get is_boss() { return false; }
+  constructor(x, y, spec, floor = 1, mutations = []) {
+    super();
+    this.spec = spec; this.name = spec.name; this.x = x; this.y = y;
+    this.size = spec.size; this.flying = spec.flying; this.floor = floor;
+    this.mutations = mutations.slice();
+
+    let health = Math.max(1.0, spec.health * (1 + 0.2 * (floor - 1)));
+    this.speed = spec.speed * Math.min(1.45, 1 + 0.04 * (floor - 1));
+    this.damage = spec.damage + (floor >= 6 ? 1 : 0) + (floor >= 11 ? 1 : 0);
+
+    this.move = spec.move;
+    this.attacks = spec.attacks.slice();
+    this.death = spec.death.slice();
+    this.passive = spec.passive.slice();
+
+    for (const m of this.mutations) {
+      if (m === "fast") this.speed *= 1.45;
+      else if (m === "armored") { health *= 1.8; this.speed *= 0.85; }
+      else if (m === "explosive" && !this.death.includes("explode")) this.death.push("explode");
+      else if (m === "regen" && !this.passive.includes("regen")) this.passive.push("regen");
+      else if (m === "splitting" && !this.death.includes("split")) this.death.push("split");
+      else if (m === "gunner" && !this.attacks.includes("shoot")) this.attacks.push("shoot");
+    }
+    this.health = health; this.max_health = health;
+
+    this.bullet_speed = Math.min(2.4, 1.4 + 0.04 * floor);
+    this.interval = Math.max(50, 125 - 6 * (floor - 1));
+    if (this.move === "static") this.interval = Math.trunc(this.interval * 1.3);
+    this.attack_timer = ri(50, this.interval + 30);
+    this.attack_index = 0;
+    this.dash_state = "idle";
+    this.dash_timer = ri(40, 90);
+    this.vx = 0; this.vy = 0;
+    this.teleport_timer = ri(120, 220);
+    this.regen_timer = 0; this.flash = 0;
+    this.age = ri(0, 100);
+    this.phase = uniform(0, PI2);
+    this.aim = [0.0, 1.0];
+    this.telegraph = false;
+    this.init_status();
+  }
+  get rect() {
+    return new Rect(Math.round(this.x - this.size / 2), Math.round(this.y - this.size / 2), this.size, this.size);
+  }
+  _step(vx, vy, rocks) {
+    if (this.flying) { this.x += vx; this.y += vy; }
+    else move_with_rocks(this, vx, vy, rocks);
+  }
+  update(player, rocks, others, bullets) {
+    this.age++;
+    this.flash = Math.max(0, this.flash - 1);
+    this.telegraph = false;
+
+    const dx = player.x - this.x, dy = player.y - this.y;
+    const dist = Math.hypot(dx, dy) || 1.0;
+    const ux = dx / dist, uy = dy / dist;
+    this.aim = [ux, uy];
+    const sm = this.speed_mult;
+    const spd = this.speed * sm;
+    const side = this.phase > Math.PI ? 1 : -1;
+
+    if (this.move === "chase") {
+      if (this.flying) {
+        const wobble = Math.sin(this.age * 0.08 + this.phase) * 0.7;
+        this.x += (ux - uy * wobble) * spd;
+        this.y += (uy + ux * wobble) * spd;
+      } else move_with_rocks(this, ux * spd, uy * spd, rocks);
+    } else if (this.move === "kite") {
+      const near_wall = this.x < ROOM.left + 25 || this.x > ROOM.right - 25 ||
+        this.y < ROOM.top + 25 || this.y > ROOM.bottom - 25;
+      let vx, vy;
+      if (dist > 115) { vx = ux; vy = uy; }
+      else if (dist < 75 && !near_wall) { vx = -ux; vy = -uy; }
+      else { vx = -uy * side; vy = ux * side; }
+      this._step(vx * spd, vy * spd, rocks);
+    } else if (this.move === "orbit") {
+      const radial = clamp((dist - 80) * 0.05, -1, 1);
+      this._step((ux * radial - uy * side) * spd, (uy * radial + ux * side) * spd, rocks);
+    } else if (this.move === "dash") {
+      this._update_dash(ux, uy, spd, sm, rocks);
+    }
+
+    const dashing = this.move === "dash" && (this.dash_state === "windup" || this.dash_state === "dash");
+    if (this.attacks.length && !dashing) {
+      this.attack_timer -= sm;
+      if (this.attack_timer < 14) this.telegraph = true;
+      if (this.attack_timer <= 0) {
+        this._attack(ux, uy, bullets);
+        this.attack_timer = this.interval + ri(-10, 20);
+      }
+    }
+
+    if (this.passive.includes("regen") && this.health < this.max_health) {
+      this.regen_timer++;
+      if (this.regen_timer >= 100) { this.health = Math.min(this.max_health, this.health + 1); this.regen_timer = 0; }
+    }
+    if (this.passive.includes("teleport")) {
+      this.teleport_timer--;
+      if (this.teleport_timer <= 0) { this._teleport(player, rocks); this.teleport_timer = ri(150, 240); }
+    }
+
+    for (const other of others) {
+      if (other === this || other.is_boss || other.flying !== this.flying) continue;
+      const ox = this.x - other.x, oy = this.y - other.y;
+      const d = Math.hypot(ox, oy);
+      const min_d = (this.size + other.size) / 2;
+      if (d > 0 && d < min_d) {
+        const push = (min_d - d) * 0.08;
+        this.x += ox / d * push; this.y += oy / d * push;
+      }
+    }
+
+    const half = this.size / 2;
+    this.x = clamp(this.x, ROOM.left + half, ROOM.right - half);
+    this.y = clamp(this.y, ROOM.top + half, ROOM.bottom - half);
+  }
+  _update_dash(ux, uy, spd, sm, rocks) {
+    this.dash_timer--;
+    if (this.dash_state === "idle") {
+      this._step(ux * spd * 0.6, uy * spd * 0.6, rocks);
+      if (this.dash_timer <= 0) { this.dash_state = "windup"; this.dash_timer = 35; }
+    } else if (this.dash_state === "windup") {
+      this.telegraph = true;
+      if (this.dash_timer <= 0) {
+        this.dash_state = "dash"; this.dash_timer = 24;
+        this.vx = ux * 3.8 * sm; this.vy = uy * 3.8 * sm;
+      }
+    } else if (this.dash_state === "dash") {
+      this._step(this.vx, this.vy, rocks);
+      if (this.dash_timer <= 0) { this.dash_state = "rest"; this.dash_timer = 40; }
+    } else if (this.dash_timer <= 0) { this.dash_state = "idle"; this.dash_timer = ri(50, 90); }
+  }
+  _attack(ux, uy, bullets) {
+    const kind = this.attacks[this.attack_index % this.attacks.length];
+    this.attack_index++;
+    const bs = this.bullet_speed;
+    const angle = Math.atan2(uy, ux);
+    if (kind === "shoot") bullets.push(new Bullet(this.x, this.y, Math.cos(angle) * bs, Math.sin(angle) * bs));
+    else if (kind === "spread") {
+      for (const off of [-0.35, 0.0, 0.35]) {
+        const a = angle + off;
+        bullets.push(new Bullet(this.x, this.y, Math.cos(a) * bs, Math.sin(a) * bs));
+      }
+    } else fire_ring(bullets, this.x, this.y, 8, uniform(0, PI2), bs);
+  }
+  _teleport(player, rocks) {
+    for (let i = 0; i < 20; i++) {
+      const angle = uniform(0, PI2), radius = uniform(70, 120);
+      const nx = clamp(player.x + Math.cos(angle) * radius, ROOM.left + 15, ROOM.right - 15);
+      const ny = clamp(player.y + Math.sin(angle) * radius, ROOM.top + 15, ROOM.bottom - 15);
+      const probe = new Rect(Math.round(nx - this.size / 2), Math.round(ny - this.size / 2), this.size, this.size);
+      if (!this.flying && rocks.some(r => probe.colliderect(r))) continue;
+      this.x = nx; this.y = ny; this.flash = 4;
+      this.attack_timer = Math.min(this.attack_timer, 20);
+      break;
+    }
+  }
+
+  draw() {
+    const x = Math.round(this.x), y = Math.round(this.y);
+    let body = this.spec.color, light = this.spec.light;
+    let tint = null;
+    if (this.mutations.length) tint = MUTATIONS[this.mutations[Math.floor(this.age / 40) % this.mutations.length]].color;
+    const status = this.status_color();
+    if (status) tint = status;
+    if (tint) {
+      const t = 0.45 + 0.2 * Math.sin(this.age * 0.15);
+      body = mix(body, tint, t);
+      light = mix(light, tint, t * 0.6);
+    }
+    if (this.flash || (this.telegraph && Math.floor(this.age / 3) % 2 === 0)) body = COLORS.white;
+
+    this["_shape_" + this.spec.shape](x, y, body, light);
+
+    if (this.mutations.length && Math.floor(this.age / 8) % 3 !== 0) {
+      const outline = MUTATIONS[this.mutations[Math.floor(this.age / 40) % this.mutations.length]].color;
+      const r = this.rect.inflate(4, 4);
+      orect(outline, r.x, r.y, r.w, r.h, 1);
+    }
+    if (this.health < this.max_health) {
+      const w = Math.max(8, this.size);
+      const top = y - Math.floor(this.size / 2) - 5;
+      frect(COLORS.dark_red, x - Math.floor(w / 2), top, w, 2);
+      frect(COLORS.red, x - Math.floor(w / 2), top, Math.trunc(w * Math.max(0, this.health) / this.max_health), 2);
+    }
+  }
+  _eyes(x, y) { frect(COLORS.dark_red, x - 4, y - 1, 2, 2); frect(COLORS.dark_red, x + 2, y - 1, 2, 2); }
+  _shape_box(x, y, body, light) {
+    const h = Math.floor(this.size / 2);
+    frect(body, x - h, y - h + 1, this.size, this.size - 1);
+    frect(light, x - h + 2, y - h, this.size - 4, 3);
+    this._eyes(x, y);
+  }
+  _shape_horn(x, y, body, light) {
+    const h = Math.floor(this.size / 2);
+    this._shape_box(x, y, body, light);
+    frect(light, x - h, y - h - 3, 3, 5);
+    frect(light, x + h - 3, y - h - 3, 3, 5);
+  }
+  _shape_round(x, y, body, light) {
+    const h = Math.floor(this.size / 2);
+    fcirc(body, x, y, h);
+    fcirc(light, x - Math.floor(h / 3), y - Math.floor(h / 3), Math.max(1, Math.floor(h / 3)));
+    if (h >= 6) this._eyes(x, y + 1);
+  }
+  _shape_cannon(x, y, body, light) {
+    const h = Math.floor(this.size / 2);
+    this._shape_box(x, y, body, light);
+    const [ax, ay] = this.aim;
+    line(light, [x, y], [Math.round(x + ax * (h + 4)), Math.round(y + ay * (h + 4))], 3);
+  }
+  _shape_turret(x, y, body, light) {
+    const h = Math.floor(this.size / 2);
+    frect(COLORS.rock_dark, x - h, y - h + 3, this.size, this.size - 3);
+    frect(body, x - h + 1, y - h + 2, this.size - 2, this.size - 4);
+    const [ax, ay] = this.aim;
+    line(light, [x, y], [Math.round(x + ax * (h + 2)), Math.round(y + ay * (h + 2))], 3);
+    fcirc(light, x, y, h - 3);
+  }
+  _shape_mage(x, y, body, light) {
+    const h = Math.floor(this.size / 2);
+    fpoly(body, [[x, y - h - 3], [x - h, y + h], [x + h, y + h]]);
+    frect(light, x - 2, y - h - 4, 4, 4);
+    frect(COLORS.white, x - 3, y, 2, 2);
+    frect(COLORS.white, x + 1, y, 2, 2);
+  }
+  _shape_tank(x, y, body, light) {
+    frect(body, x - 9, y - 8, 18, 17);
+    frect(light, x - 8, y - 9, 16, 4);
+    frect(light, x - 11, y - 4, 2, 3);
+    frect(light, x + 9, y - 4, 2, 3);
+    frect(COLORS.dark_red, x - 5, y - 1, 3, 3);
+    frect(COLORS.dark_red, x + 2, y - 1, 3, 3);
+  }
+  _shape_spider(x, y, body, light) {
+    const h = Math.floor(this.size / 2);
+    for (const s of [-1, 1]) for (const k of [-3, 0, 3])
+      line(light, [x, y + Math.floor(k / 2)], [x + s * (h + 4), y + k * 2 - 1], 1);
+    fcirc(body, x, y, h - 1);
+    fcirc(light, x - 2, y - 3, 1);
+    this._eyes(x, y);
+  }
+  _shape_skull(x, y, body, light) {
+    const h = Math.floor(this.size / 2);
+    frect(body, x - h, y - h, this.size, this.size - 3);
+    frect(light, x - h + 2, y + h - 5, this.size - 4, 4);
+    frect(COLORS.panel, x - 4, y - 3, 3, 3);
+    frect(COLORS.panel, x + 1, y - 3, 3, 3);
+    frect(COLORS.panel, x - 1, y + 2, 2, 2);
+  }
+  _shape_ghost(x, y, body, light) {
+    const h = Math.floor(this.size / 2);
+    const bob = Math.round(Math.sin(this.age * 0.1) * 2);
+    fcirc(body, x, y - 2 + bob, h - 1);
+    frect(body, x - h + 1, y - 2 + bob, this.size - 2, h);
+    for (let i = 0; i < 3; i++) frect(body, x - h + 1 + i * Math.floor(this.size / 3), y + h - 2 + bob, 3, 2);
+    fcirc(light, x - 2, y - 5 + bob, 1);
+    frect(COLORS.panel, x - 3, y - 3 + bob, 2, 3);
+    frect(COLORS.panel, x + 1, y - 3 + bob, 2, 3);
+  }
+  _shape_flame(x, y, body, light) {
+    const h = Math.floor(this.size / 2);
+    const flick = Math.floor(this.age / 4) % 2;
+    fell(COLORS.shadow, x - 4, y + h + 2, 8, 3);
+    fpoly(body, [[x, y - h - 3 - flick], [x - h, y + h], [x + h, y + h]]);
+    fpoly(light, [[x, y - h + 2], [x - Math.floor(h / 2), y + h], [x + Math.floor(h / 2), y + h]]);
+    frect(COLORS.panel, x - 3, y, 2, 2);
+    frect(COLORS.panel, x + 1, y, 2, 2);
+  }
+  _shape_crystal(x, y, body, light) {
+    const h = Math.floor(this.size / 2);
+    fpoly(COLORS.rock_dark, [[x, y - h - 1], [x + h + 2, y + 2], [x, y + h + 4], [x - h - 2, y + 2]]);
+    fpoly(body, [[x, y - h - 2], [x + h, y], [x, y + h + 2], [x - h, y]]);
+    fpoly(light, [[x, y - h + 1], [x + Math.floor(h / 2), y], [x, y + 2], [x - Math.floor(h / 2), y]]);
+  }
+  _shape_fly(x, y, body, light) {
+    const bob = Math.round(Math.sin(this.age * 0.15) * 2);
+    fell(COLORS.shadow, x - 4, y + 7, 8, 3);
+    const wing_h = 3 + (Math.floor(this.age / 4) % 2) * 2;
+    frect(COLORS.white, x - 9, y - 5 + bob, 5, wing_h);
+    frect(COLORS.white, x + 4, y - 5 + bob, 5, wing_h);
+    fcirc(body, x, y + bob, 5);
+    fcirc(light, x - 1, y - 2 + bob, 1);
+    frect(COLORS.red, x - 3, y - 1 + bob, 2, 2);
+    frect(COLORS.red, x + 1, y - 1 + bob, 2, 2);
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Bosses (e mini bosses)
+// ----------------------------------------------------------------------------
+const BOSS_INFO = {
+  king: ["REI SLIME", 30, 40, [150, 60, 160], [206, 120, 214]],
+  bull: ["TOURO DE FERRO", 30, 40, [170, 110, 70], [222, 170, 120]],
+  wizard: ["MAGO SOMBRIO", 26, 34, [60, 60, 150], [130, 130, 230]],
+  eye: ["OLHO VIGILANTE", 30, 46, [200, 90, 90], [240, 200, 200]],
+  golem: ["GOLEM DE PEDRA", 36, 58, [100, 96, 110], [150, 146, 160]],
+};
+const BOSS_KINDS = Object.keys(BOSS_INFO);
+const MINI_SCALE = 0.7;
+const miniCanvas = document.createElement("canvas");
+miniCanvas.width = 80; miniCanvas.height = 80;
+const miniCtx = miniCanvas.getContext("2d");
+
+class Boss extends Combatant {
+  get is_boss() { return true; }
+  get flying() { return false; }
+  constructor(x, y, kind, floor, mini = false) {
+    super();
+    let [name, size, base_hp, color, light] = BOSS_INFO[kind];
+    this.mini = mini;
+    this.draw_size = size;
+    let hp_per_floor;
+    if (mini) {
+      name = "MINI " + name;
+      size = Math.trunc(size * MINI_SCALE);
+      base_hp = Math.max(10, Math.trunc(base_hp * 0.4));
+      hp_per_floor = 6;
+    } else hp_per_floor = 16;
+    this.kind = kind; this.name = name; this.size = size; this.color = color; this.light = light;
+    this.x = x; this.y = y; this.level = floor;
+    this.max_health = base_hp + hp_per_floor * (floor - 1);
+    this.health = this.max_health;
+    this.damage = mini ? 1 : 2;
+    this.bs = Math.min(2.3, 1.4 + 0.04 * floor);
+    this.extra = Math.floor((floor - 1) / (mini ? 4 : 2));
+    this.flash = 0; this.age = 0; this.state = "idle"; this.timer = 90;
+    this.summon_timer = 240; this.cast_count = 0; this.spin = 0.0;
+    this.vx = 0; this.vy = 0; this.aim = [0.0, 1.0];
+    this.init_status();
+  }
+  get rect() {
+    return new Rect(Math.round(this.x - this.size / 2), Math.round(this.y - this.size / 2), this.size, this.size);
+  }
+  get enraged() { return this.health <= this.max_health / 2; }
+  get speed_mult() { return 1.0; }
+  apply_fx(fx) { super.apply_fx(new Set([...fx].filter(f => f !== "ice"))); }
+
+  update(player, rocks, others, bullets) {
+    this.age++;
+    this.flash = Math.max(0, this.flash - 1);
+    this._toward(player);
+    this["_update_" + this.kind](player, others, bullets);
+    const half = this.size / 2;
+    this.x = clamp(this.x, ROOM.left + half, ROOM.right - half);
+    this.y = clamp(this.y, ROOM.top + half, ROOM.bottom - half);
+  }
+  _toward(player) {
+    const dx = player.x - this.x, dy = player.y - this.y;
+    const d = Math.hypot(dx, dy) || 1.0;
+    this.aim = [dx / d, dy / d];
+    return this.aim;
+  }
+  _summon(others, spec_id, count, cooldown, cap) {
+    this.summon_timer--;
+    if (this.summon_timer > 0) return;
+    if (this.mini) { count = 1; cap = Math.min(cap, 3); cooldown = Math.trunc(cooldown * 1.5); }
+    if (others.length < cap) {
+      for (let i = 0; i < count; i++) {
+        const sx = (i - (count - 1) / 2) * 26;
+        others.push(new Enemy(this.x + sx, this.y, ENEMY_SPECS[spec_id], this.level));
+      }
+    }
+    this.summon_timer = cooldown;
+  }
+  _update_king(player, others, bullets) {
+    const [ux, uy] = this.aim;
+    const speed = this.enraged ? 0.55 : 0.35;
+    this.x += ux * speed; this.y += uy * speed;
+    this.timer--;
+    if (this.timer <= 0) {
+      const count = (this.enraged ? 12 : 8) + this.extra;
+      fire_ring(bullets, this.x, this.y, count, this.age * 0.05, this.bs);
+      this.timer = this.enraged ? 70 : 100;
+    }
+    this._summon(others, "fly", 2, this.enraged ? 300 : 420, 6);
+  }
+  _update_bull(player, others, bullets) {
+    const [ux, uy] = this.aim;
+    if (this.state === "idle") {
+      this.x += ux * 0.5; this.y += uy * 0.5;
+      this.timer--;
+      if (this.timer <= 0) { this.state = "windup"; this.timer = this.enraged ? 30 : 40; }
+    } else if (this.state === "windup") {
+      this.timer--;
+      if (this.timer <= 0) {
+        const charge = this.enraged ? 5.0 : 4.2;
+        this.vx = ux * charge; this.vy = uy * charge; this.state = "charge";
+      }
+    } else if (this.state === "charge") {
+      this.x += this.vx; this.y += this.vy;
+      const half = this.size / 2;
+      if (this.x <= ROOM.left + half || this.x >= ROOM.right - half ||
+          this.y <= ROOM.top + half || this.y >= ROOM.bottom - half) {
+        const count = (this.enraged ? 10 : 6) + this.extra;
+        fire_ring(bullets, this.x, this.y, count, this.age * 0.1, this.bs * 0.95);
+        this.state = "stun"; this.timer = 45;
+      }
+    } else if (this.state === "stun") {
+      this.timer--;
+      if (this.timer <= 0) { this.state = "idle"; this.timer = this.enraged ? 50 : 70; }
+    }
+  }
+  _update_wizard(player, others, bullets) {
+    this.y += Math.sin(this.age * 0.07) * 0.4;
+    this.timer--;
+    if (this.state === "idle" && this.timer <= 0) {
+      for (let i = 0; i < 30; i++) {
+        const rx = ri(ROOM.left + 30, ROOM.right - 30), ry = ri(ROOM.top + 30, ROOM.bottom - 30);
+        if (Math.hypot(rx - player.x, ry - player.y) > 90) { this.x = rx; this.y = ry; break; }
+      }
+      this.state = "cast"; this.timer = 24;
+    } else if (this.state === "cast" && this.timer <= 0) {
+      this._toward(player);
+      this.cast_count++;
+      const base = Math.atan2(this.aim[1], this.aim[0]);
+      const n = 5 + this.extra + (this.enraged ? 2 : 0);
+      for (let i = 0; i < n; i++) {
+        const a = base + (i - (n - 1) / 2) * 0.22;
+        bullets.push(new Bullet(this.x, this.y, Math.cos(a) * this.bs, Math.sin(a) * this.bs));
+      }
+      if (this.cast_count % 3 === 0) fire_ring(bullets, this.x, this.y, 10 + this.extra, this.age * 0.07, this.bs * 0.8);
+      this.state = "idle"; this.timer = this.enraged ? 80 : 110;
+    }
+    this._summon(others, "shooter", 2, this.enraged ? 380 : 520, 5);
+  }
+  _update_eye(player, others, bullets) {
+    const cx = ROOM.centerx, cy = ROOM.centery;
+    this.x = cx + Math.sin(this.age * 0.02) * 70;
+    this.y = cy + Math.cos(this.age * 0.027) * 40;
+    this.timer--;
+    if (this.state === "idle") {
+      if (this.timer <= 0) { this.state = "spiral"; this.timer = this.enraged ? 170 : 130; }
+    } else if (this.state === "spiral") {
+      if (this.age % 5 === 0) {
+        const arms = (this.enraged ? 2 : 1) + (this.extra >= 2 ? 1 : 0);
+        this.spin += 0.38;
+        for (let k = 0; k < arms; k++) {
+          const a = this.spin + k * PI2 / arms;
+          bullets.push(new Bullet(this.x, this.y, Math.cos(a) * this.bs, Math.sin(a) * this.bs));
+        }
+      }
+      if (this.timer <= 0) {
+        fire_ring(bullets, this.x, this.y, 12 + this.extra, this.age * 0.1, this.bs * 0.9);
+        this.state = "rest"; this.timer = 70;
+      }
+    } else if (this.state === "rest" && this.timer <= 0) { this.state = "idle"; this.timer = 30; }
+    this._summon(others, "fly", 2, this.enraged ? 300 : 400, 6);
+  }
+  _update_golem(player, others, bullets) {
+    const [ux, uy] = this.aim;
+    if (this.state === "idle") {
+      const speed = this.enraged ? 0.45 : 0.3;
+      this.x += ux * speed; this.y += uy * speed;
+      this.timer--;
+      if (this.timer <= 0) { this.state = "windup"; this.timer = this.enraged ? 30 : 40; }
+    } else if (this.state === "windup") {
+      this.timer--;
+      if (this.timer <= 0) {
+        const count = 12 + this.extra * 2;
+        fire_ring(bullets, this.x, this.y, count, this.age * 0.1, this.bs);
+        if (this.enraged) fire_ring(bullets, this.x, this.y, count, this.age * 0.1 + Math.PI / count, this.bs * 0.65);
+        this.state = "idle"; this.timer = this.enraged ? 90 : 120;
+      }
+    }
+  }
+  draw() {
+    if (!this.mini) { this._draw_at(Math.round(this.x), Math.round(this.y)); return; }
+    const main = g;
+    g = miniCtx;
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.clearRect(0, 0, 80, 80);
+    this._draw_at(40, 40);
+    g = main;
+    const side = Math.max(8, Math.trunc(80 * this.size / this.draw_size));
+    g.imageSmoothingEnabled = false;
+    g.drawImage(miniCanvas, Math.round(this.x) - Math.floor(side / 2), Math.round(this.y) - Math.floor(side / 2), side, side);
+  }
+  _draw_at(x, y) {
+    let base = this.color; const light = this.light;
+    const status = this.status_color();
+    if (status) base = mix(base, status, 0.4);
+    const telegraph = this.state === "windup" || this.state === "cast";
+    if (this.flash || (telegraph && Math.floor(this.age / 3) % 2 === 0)) base = COLORS.white;
+
+    const ds = this.draw_size, h = Math.floor(ds / 2);
+    if (this.state === "windup") x += ri(-1, 1);
+
+    fell(COLORS.shadow, x - h, y + h - 3, ds, 7);
+    const eye = this.enraged ? COLORS.red : COLORS.dark_red;
+
+    if (this.kind === "king" || this.kind === "bull") {
+      frect(base, x - 15, y - 14, 30, 29);
+      frect(light, x - 13, y - 15, 26, 5);
+      if (this.kind === "king") {
+        frect(COLORS.gold, x - 11, y - 17, 22, 3);
+        for (const cx of [-10, -2, 6]) frect(COLORS.gold, x + cx, y - 22, 4, 6);
+      } else {
+        frect(COLORS.white, x - 19, y - 17, 5, 9);
+        frect(COLORS.white, x + 14, y - 17, 5, 9);
+      }
+      frect(eye, x - 8, y - 3, 4, 4);
+      frect(eye, x + 4, y - 3, 4, 4);
+      frect(COLORS.dark_red, x - 7, y + 6, 14, 3);
+    } else if (this.kind === "wizard") {
+      fpoly(base, [[x, y - h - 6], [x - h, y + h], [x + h, y + h]]);
+      frect(light, x - 4, y - h - 8, 8, 5);
+      frect(COLORS.gold, x - 1, y - h - 11, 2, 3);
+      frect(eye, x - 5, y - 2, 3, 3);
+      frect(eye, x + 2, y - 2, 3, 3);
+    } else if (this.kind === "eye") {
+      fcirc(!this.flash ? COLORS.white : base, x, y, h);
+      ocirc(base, x, y, h, 2);
+      const [ax, ay] = this.aim;
+      const ix = Math.round(x + ax * 6), iy = Math.round(y + ay * 6);
+      fcirc(this.enraged ? eye : light, ix, iy, 8);
+      fcirc(COLORS.panel, ix, iy, 4);
+    } else {
+      frect(base, x - h, y - h, ds, ds);
+      frect(light, x - h + 2, y - h, ds - 4, 6);
+      frect(light, x - h - 4, y - 6, 6, 16);
+      frect(light, x + h - 2, y - 6, 6, 16);
+      frect(eye, x - 9, y - 6, 5, 5);
+      frect(eye, x + 4, y - 6, 5, 5);
+      frect(COLORS.rock_dark, x - 8, y + 6, 16, 3);
+    }
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Jogador
+// ----------------------------------------------------------------------------
+class Player {
+  constructor() {
+    this.x = VW / 2; this.y = VH / 2; this.size = PLAYER_SIZE; this.speed = PLAYER_SPEED;
+    this.max_hp = PLAYER_MAX_HP; this.hp = PLAYER_MAX_HP; this.damage = 1;
+    this.cooldown = TEAR_COOLDOWN; this.shots = 1; this.tear_speed = TEAR_SPEED;
+    this.tear_life = TEAR_LIFE; this.tear_fx = new Set();
+    this.invuln_frames = INVULN_FRAMES; this.invuln = 0;
+    this.bombs = 1; this.keys = 0; this.bomb_damage = 5; this.coins = 0;
+    this.weapon = "tear"; this.brim_charge = 0; this.map_reveal = false;
+    this.items = [];
+    this.active = null; this.active_charge = 0; this.fury = 0; this.shield = 0;
+  }
+  get damage_mult() { return this.fury > 0 ? 2 : 1; }
+  get brim_need() { return Math.max(18, Math.trunc(this.cooldown * 3)); }
+  get rect() {
+    return new Rect(Math.round(this.x - this.size / 2), Math.round(this.y - this.size / 2), this.size, this.size);
+  }
+  move(keys, rocks) {
+    let dx = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
+    let dy = (keys.KeyS ? 1 : 0) - (keys.KeyW ? 1 : 0);
+    if (dx && dy) { dx *= 0.7071; dy *= 0.7071; }
+    move_with_rocks(this, dx * this.speed, dy * this.speed, rocks);
+    const half = this.size / 2;
+    this.x = clamp(this.x, ROOM.left + half, ROOM.right - half);
+    this.y = clamp(this.y, ROOM.top + half, ROOM.bottom - half);
+  }
+  draw() {
+    const x = Math.round(this.x), y = Math.round(this.y);
+    if (this.shield > 0 && (this.shield > 60 || Math.floor(this.shield / 5) % 2 === 0)) {
+      ocirc([140, 200, 255], x, y, 11, 1);
+      ocirc([210, 235, 255], x, y, 9, 1);
+    }
+    if ((this.weapon === "brimstone" || this.weapon === "techx") && this.brim_charge > 0) {
+      const need = this.brim_need;
+      const ready = this.brim_charge >= need;
+      const radius = 2 + Math.trunc(5 * this.brim_charge / need);
+      const base_glow = this.weapon === "brimstone" ? [200, 30, 40] : [90, 230, 255];
+      const glow = ready && Math.floor(performance.now() / 80) % 2 === 0 ? COLORS.white : base_glow;
+      fcirc(glow, x, y - 11, radius);
+    }
+    if (this.invuln > 0 && Math.floor(this.invuln / 4) % 2 === 0) return;
+    let body = COLORS.player;
+    if (this.fury > 0) body = mix(body, COLORS.red, 0.55 + 0.25 * Math.sin(performance.now() / 90));
+    frect(body, x - 6, y - 6, 12, 13);
+    frect(COLORS.player_light, x - 4, y - 7, 8, 3);
+    frect(COLORS.white, x - 3, y - 2, 2, 2);
+    frect(COLORS.white, x + 2, y - 2, 2, 2);
+  }
+}
+
+function apply_item(player, item_id) {
+  const data = ITEMS[item_id];
+  for (const [stat, delta] of Object.entries(data.stats || {})) player[stat] += delta;
+  player.hp = Math.min(player.max_hp, player.hp + (data.heal || 0));
+  player.cooldown = Math.max(5, player.cooldown);
+  player.shots = Math.min(3, player.shots);
+  player.tear_speed = Math.max(2.0, player.tear_speed);
+  if (data.fx) player.tear_fx.add(data.fx);
+  if (data.weapon) { player.weapon = data.weapon; player.brim_charge = 0; }
+  if (data.flag === "map") player.map_reveal = true;
+  if (!player.items.includes(item_id)) player.items.push(item_id);
+}
+
+// ----------------------------------------------------------------------------
+// Salas
+// ----------------------------------------------------------------------------
+function spawn_horde(rocks, player_pos, floor, custom_specs) {
+  const stage_enemies = ACTIVE_STAGE.enemies;
+  const pool = Object.values(ENEMY_SPECS)
+    .filter(s => s.min_floor <= floor && s.weight > 0)
+    .map(s => [s, s.weight * (stage_enemies.includes(s.id) ? 2 : 1)]);
+  for (const s of custom_specs) pool.push([s, s.weight]);
+  const specs = pool.map(p => p[0]), weights = pool.map(p => p[1]);
+
+  const caps = { tank: 1, turret: 2, yeti: 1, crystal: 2, hydra: 1, magma: 2 };
+  const used = {}, enemies = [];
+  const count = Math.min(9, ri(3, 5) + Math.floor((floor - 1) / 2));
+
+  for (let n = 0; n < count; n++) {
+    let spec = choices(specs, weights);
+    if ((used[spec.id] || 0) >= (caps[spec.id] ?? 99)) spec = ENEMY_SPECS.chaser;
+    const size = spec.size;
+    for (let a = 0; a < 100; a++) {
+      const x = ri(ROOM.left + 25, ROOM.right - 25), y = ri(ROOM.top + 25, ROOM.bottom - 25);
+      if (Math.hypot(x - player_pos[0], y - player_pos[1]) < 70) continue;
+      const cand = new Rect(x - Math.floor(size / 2), y - Math.floor(size / 2), size, size);
+      if (!spec.flying && rocks.some(r => cand.colliderect(r.inflate(6, 6)))) continue;
+      enemies.push(new Enemy(x, y, spec, floor, roll_mutations(floor)));
+      used[spec.id] = (used[spec.id] || 0) + 1;
+      break;
+    }
+  }
+  return enemies;
+}
+
+const ROOM_BANNERS = {
+  secret: ["SALA SECRETA!", ""],
+  super: ["SUPER SALA SECRETA!", ""],
+  devil: ["SALA DO DEMONIO", "Cada pacto custa vida maxima"],
+  angel: ["SALA DO ANJO", "Escolha UMA bencao gratuita"],
+  shop: ["LOJA", "Gaste suas moedas"],
+};
+
+class Room {
+  constructor(key, neighbors, role = "combat", boss_kind = "king") {
+    this.position = key;
+    this.neighbors = neighbors;
+    this.role = role;
+    this.boss_kind = boss_kind;
+    this.mini_boss = false;
+    this.mini_kind = null;
+    if (role === "combat") this.rocks = make_rocks(ri(3, 6));
+    else if (role === "start") this.rocks = make_rocks(2);
+    else this.rocks = [];
+    this.enemies = []; this.chests = []; this.pickups = []; this.items = [];
+    this.hatch = null; this.bonus_key = false;
+    this.hidden = {}; this.secret_doors = new Set();
+    this.announced = false;
+    this.locked = role === "treasure";
+    this.visited = role === "start";
+    this.spawned = ["start", "treasure", "secret", "super", "devil", "angel", "shop"].includes(role);
+    this.cleared = this.spawned;
+    this.rewarded = this.spawned;
+  }
+  get floor_color() {
+    const m = { secret: COLORS.floor_secret, super: COLORS.floor_super, boss: COLORS.floor_boss,
+      treasure: COLORS.floor_treasure, devil: COLORS.floor_devil, angel: COLORS.floor_angel,
+      shop: COLORS.floor_shop };
+    return m[this.role] || ACTIVE_STAGE.floor;
+  }
+  enter(game) {
+    this.visited = true;
+    if (this.role in ROOM_BANNERS && !this.announced) {
+      this.announced = true;
+      const [title, sub] = ROOM_BANNERS[this.role];
+      game.show_banner(title, sub, 150);
+    }
+    if (this.spawned) return;   // a horda so nasce na PRIMEIRA vez
+    this.spawned = true;
+    const player = game.player;
+    if (this.role === "boss") {
+      const boss = new Boss(ROOM.centerx, ROOM.centery, this.boss_kind, game.floor);
+      this.enemies = [boss];
+      game.show_banner(boss.name, "Cuidado!", 150);
+    } else if (this.mini_boss) {
+      const boss = new Boss(ROOM.centerx, ROOM.centery, this.mini_kind, game.floor, true);
+      this.enemies = [boss];
+      game.show_banner(boss.name, "Um mini boss apareceu!", 150);
+    } else {
+      this.enemies = spawn_horde(this.rocks, [player.x, player.y], game.floor, game.custom_specs);
+    }
+    if (!this.enemies.length) this.cleared = true;
+  }
+  update() {
+    if (this.spawned && !this.cleared && !this.enemies.length) this.cleared = true;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Estado do jogo
+// ----------------------------------------------------------------------------
+class Game {
+  constructor() {
+    this.player = new Player();
+    this.floor = 1;
+    this.custom_specs = [];
+    this.last_boss = null;
+    this.tears = []; this.bullets = []; this.bombs = []; this.explosions = [];
+    this.lasers = []; this.rings = [];
+    this.aim_angle = 0.0; this.shoot_timer = 0;
+    this.game_over = false;
+    this.banner = null;
+    this.rooms = new Map();
+    this.room = null;
+    this.build_floor();
+    this.show_banner("ANDAR 1", "TAB abre o painel de status", 200);
+  }
+
+  build_floor() {
+    const [stage] = stage_for(this.floor);
+    for (const k of Object.keys(ACTIVE_STAGE)) delete ACTIVE_STAGE[k];
+    Object.assign(ACTIVE_STAGE, stage);
+
+    const layout = generate_dungeon(Math.min(8 + this.floor, 13));
+    const dist = bfs_distances(layout);
+    const nb = (p) => Object.keys(get_neighbors(layout, p)).length;
+    const others = [...layout].filter(p => p !== "0,0");
+    const far = Math.max(...others.map(p => dist.get(p)));
+    const boss_pos = choice(others.filter(p => dist.get(p) === far));
+    const candidates = others.filter(p => p !== boss_pos);
+    const dead_ends = candidates.filter(p => nb(p) === 1);
+    const treasure_pos = choice(dead_ends.length ? dead_ends : candidates);
+    const rest = candidates.filter(p => p !== treasure_pos);
+    const shop_ends = rest.filter(p => nb(p) === 1);
+    const shop_pos = rest.length >= 3 ? choice(shop_ends.length ? shop_ends : rest) : null;
+    const combat = rest.filter(p => p !== shop_pos);
+    const boss_kind = choice(BOSS_KINDS.filter(k => k !== this.last_boss));
+    this.last_boss = boss_kind;
+
+    this.rooms = new Map();
+    for (const pos of layout) {
+      let role;
+      if (pos === "0,0") role = "start";
+      else if (pos === boss_pos) role = "boss";
+      else if (pos === treasure_pos) role = "treasure";
+      else if (pos === shop_pos) role = "shop";
+      else role = "combat";
+      this.rooms.set(pos, new Room(pos, get_neighbors(layout, pos), role, boss_kind));
+    }
+
+    this.add_secret_rooms(layout);
+    this.add_special_rooms(boss_pos);
+
+    const mini_kinds = BOSS_KINDS.filter(k => k !== boss_kind);
+    const mini_count = 1 + (rand() < 0.4 ? 1 : 0);
+    for (const pos of sample(combat, Math.min(mini_count, combat.length))) {
+      this.rooms.get(pos).mini_boss = true;
+      this.rooms.get(pos).mini_kind = choice(mini_kinds);
+    }
+    for (const pos of sample(combat, Math.min(2, combat.length))) this.rooms.get(pos).bonus_key = true;
+
+    const gold_pos = combat.length ? choice(combat) : null;
+    for (const pos of combat) {
+      const room = this.rooms.get(pos);
+      const kind = pos === gold_pos ? "gold" : (rand() < 0.3 ? "wood" : null);
+      if (kind) {
+        const spot = find_free_spot(room.rocks, 16, 13, room.chests.map(c => c.rect));
+        if (spot) room.chests.push(new Chest(spot.centerx, spot.centery, kind));
+      }
+    }
+
+    const cx = ROOM.centerx, cy = ROOM.centery;
+    this.rooms.get(treasure_pos).items.push(new Item(cx, cy, this.random_item()));
+    this.fill_secret_rooms();
+    this.fill_special_rooms();
+    this.fill_shop();
+
+    this.room = this.rooms.get("0,0");
+    this.player.x = cx; this.player.y = cy;
+    this.lasers = []; this.rings = []; this.tears = []; this.bullets = []; this.bombs = []; this.explosions = [];
+  }
+
+  add_secret_rooms(layout) {
+    const eligible = new Set();
+    for (const [k, r] of this.rooms) if (["start", "combat", "treasure"].includes(r.role)) eligible.add(k);
+    const empties = [];
+    for (let x = -3; x <= 3; x++) for (let y = -3; y <= 3; y++) if (!layout.has(ck(x, y))) empties.push([x, y]);
+    const around = (c) => Object.values(DIRECTIONS).map(([dx, dy]) => ck(c[0] + dx, c[1] + dy));
+    const count = (c) => around(c).filter(a => eligible.has(a)).length;
+
+    let secret_cell = null;
+    let cands = empties.filter(c => count(c) >= 2);
+    if (cands.length) {
+      const best = Math.max(...cands.map(count));
+      secret_cell = choice(cands.filter(c => count(c) === best));
+    }
+    let super_cell = null;
+    cands = empties.filter(c => c !== secret_cell
+      && around(c).filter(a => layout.has(a)).length === 1 && count(c) === 1
+      && (!secret_cell || Math.abs(c[0] - secret_cell[0]) + Math.abs(c[1] - secret_cell[1]) > 1));
+    if (cands.length) super_cell = choice(cands);
+
+    for (const [cell, role] of [[secret_cell, "secret"], [super_cell, "super"]]) {
+      if (!cell) continue;
+      const key = ck(cell[0], cell[1]);
+      this.rooms.set(key, new Room(key, {}, role));
+      for (const a of around(cell)) {
+        if (eligible.has(a)) {
+          const [ax, ay] = P(a);
+          this.rooms.get(a).hidden[DIR_BY_VECTOR[(cell[0] - ax) + "," + (cell[1] - ay)]] = key;
+        }
+      }
+    }
+  }
+
+  add_special_rooms(boss_pos) {
+    const attachable = [...this.rooms].filter(([k, r]) => ["start", "combat", "treasure", "boss"].includes(r.role)).map(([k]) => k);
+    const free_cells_next_to = (positions) => {
+      const options = [];
+      for (const pos of positions) {
+        const [px, py] = P(pos);
+        for (const [direction, [dx, dy]] of Object.entries(DIRECTIONS)) {
+          const cx = px + dx, cy = py + dy;
+          if (Math.abs(cx) <= 3 && Math.abs(cy) <= 3 && !this.rooms.has(ck(cx, cy))) options.push([ck(cx, cy), pos, direction]);
+        }
+      }
+      return options;
+    };
+    for (const role of ["devil", "angel"]) {
+      let options = free_cells_next_to([boss_pos]);
+      if (!options.length) options = free_cells_next_to(attachable);
+      if (!options.length) continue;
+      const [cell, source, direction] = choice(options);
+      const room = new Room(cell, { [OPPOSITE[direction]]: source }, role);
+      this.rooms.set(cell, room);
+      this.rooms.get(source).neighbors[direction] = cell;
+    }
+  }
+
+  fill_secret_rooms() {
+    const cx = ROOM.centerx, cy = ROOM.centery;
+    for (const room of this.rooms.values()) {
+      if (room.role === "secret") {
+        for (const [dx, dy] of [[-34, 0], [0, -22], [34, 0], [0, 22]])
+          if (rand() < 0.85) this.drop_pickup(room, cx + dx, cy + dy);
+        if (rand() < 0.5) room.chests.push(new Chest(cx, cy - 40, "wood"));
+      } else if (room.role === "super") {
+        room.items.push(new Item(cx, cy, this.random_item()));
+        room.chests.push(new Chest(cx - 45, cy, "wood"));
+      }
+    }
+  }
+
+  fill_special_rooms() {
+    const cx = ROOM.centerx, cy = ROOM.centery;
+    for (const room of this.rooms.values()) {
+      if (room.role === "devil") {
+        const devil_only = Object.keys(ITEMS).filter(i => ITEMS[i].devil_only);
+        const normal = Object.keys(ITEMS).filter(i => !ITEMS[i].devil_only && !ITEMS[i].active
+          && !ITEMS[i].shop_only && !("max_hp" in ITEMS[i].stats));
+        const chosen = [];
+        for (const pool of [Object.keys(ACTIVES), devil_only, normal]) {
+          const pick = this.random_item(pool, chosen);
+          if (pick) chosen.push(pick);
+        }
+        const n = chosen.length;
+        chosen.forEach((item_id, i) => {
+          const x = cx + (i - (n - 1) / 2) * 46;
+          room.items.push(new Item(x, cy, item_id, ITEMS[item_id].cost ?? 2));
+        });
+      } else if (room.role === "angel") {
+        const chosen = [];
+        const homing = this.random_item(["homing"]);
+        if (homing) chosen.push(homing);
+        while (chosen.length < 2) {
+          const pick = this.random_item(ANGEL_POOL, chosen);
+          if (!pick) break;
+          chosen.push(pick);
+        }
+        const pick = this.random_item(Object.keys(ACTIVES), chosen);
+        if (pick) chosen.push(pick);
+        const n = chosen.length;
+        chosen.forEach((item_id, i) => {
+          const x = cx + (i - (n - 1) / 2) * 46;
+          room.items.push(new Item(x, cy, item_id, 0, "angel"));
+        });
+      }
+    }
+  }
+
+  fill_shop() {
+    const cx = ROOM.centerx, cy = ROOM.centery;
+    for (const room of this.rooms.values()) {
+      if (room.role !== "shop") continue;
+      const passives = Object.keys(ITEMS).filter(i => !ITEMS[i].active && !ITEMS[i].devil_only && !ITEMS[i].shop_only);
+      const stock = [];
+      for (let k = 0; k < 2; k++) {
+        const pick = this.random_item(passives, stock.map(s => s[0]));
+        if (pick) stock.push([pick, 10]);
+      }
+      const pick = this.random_item(Object.keys(ACTIVES), stock.map(s => s[0]));
+      if (pick) stock.push([pick, 15]);
+      const n = stock.length;
+      stock.forEach(([item_id, price], i) => room.items.push(new Item(cx + (i - (n - 1) / 2) * 56, cy - 28, item_id, 0, null, price)));
+      [["shop_heart", 3], ["shop_bomb", 5], ["shop_key", 5]].forEach(([item_id, price], i) =>
+        room.items.push(new Item(cx + (i - 1) * 56, cy + 26, item_id, 0, null, price)));
+    }
+  }
+
+  next_floor() {
+    this.floor++;
+    let title = "ANDAR " + this.floor;
+    let sub = "Os inimigos estao mais fortes";
+    if (this.floor % 2 === 0) {
+      const spec = generate_custom_enemy(this.floor);
+      this.custom_specs.push(spec);
+      sub = `Novo inimigo: ${spec.name} (${spec.desc})`;
+    }
+    this.build_floor();
+    const [stage, number] = stage_for(this.floor);
+    if ((this.floor - 1) % 2 === 0) {
+      title = `FASE ${number}: ${stage.name}`;
+      if (number <= STAGES.length) sub = "Novos inimigos: " + stage.enemies.map(e => ENEMY_SPECS[e].name).join(", ");
+      else sub = "O ciclo recomeca, ainda mais dificil";
+    }
+    this.show_banner(title, sub, 260);
+  }
+
+  random_item(pool = null, exclude = []) {
+    const lying = new Set();
+    for (const r of this.rooms.values()) for (const i of r.items) lying.add(i.item_id);
+    const owned = new Set([...this.player.items, this.player.active]);
+    const base = pool === null ? Object.keys(ITEMS) : pool.slice();
+    const cands = base.filter(i => !owned.has(i) && !lying.has(i) && !exclude.includes(i)
+      && (pool !== null || !(ITEMS[i].devil_only || ITEMS[i].shop_only)));
+    if (cands.length) return choice(cands);
+    return pool === null ? "bombbag" : null;
+  }
+
+  show_banner(title, sub = "", frames = 120, only_if_empty = false) {
+    if (only_if_empty && this.banner) return;
+    this.banner = [title, sub, frames];
+  }
+
+  hurt_player(amount) {
+    const p = this.player;
+    if (p.invuln > 0 || p.shield > 0 || this.game_over) return;
+    p.hp -= amount;
+    p.invuln = p.invuln_frames;
+    if (p.hp <= 0) { p.hp = 0; this.game_over = true; }
+  }
+
+  drop_pickup(room, x, y, kind = null) {
+    kind = kind || choices(["heart", "bomb", "key", "coin"], [4, 3, 2, 7]);
+    let px = x, py = y;
+    for (let i = 0; i < 12; i++) {
+      const tx = clamp(x + ri(-14, 14), ROOM.left + 12, ROOM.right - 12);
+      const ty = clamp(y + ri(-14, 14), ROOM.top + 12, ROOM.bottom - 12);
+      if (!room.rocks.some(r => r.collidepoint(tx, ty))) { px = tx; py = ty; break; }
+    }
+    room.pickups.push(new Pickup(px, py, kind));
+  }
+  drop_coins(room, x, y, count) { for (let i = 0; i < count; i++) this.drop_pickup(room, x, y, "coin"); }
+
+  hit_enemy(enemy, amount, fx = new Set()) {
+    enemy.health -= amount;
+    enemy.flash = 5;
+    if (fx && fx.size) enemy.apply_fx(fx);
+    if (enemy.health <= 0) this.kill_enemy(enemy);
+  }
+
+  kill_enemy(enemy) {
+    const room = this.room;
+    const idx = room.enemies.indexOf(enemy);
+    if (idx < 0) return;
+    room.enemies.splice(idx, 1);
+    if (enemy.is_boss) { room.enemies.length = 0; this.bullets = []; return; }
+    if (enemy.death.includes("explode")) this.enemy_explode(enemy.x, enemy.y);
+    if (enemy.death.includes("split")) for (const sx of [-7, 7]) room.enemies.push(new Enemy(enemy.x + sx, enemy.y, MINI_SPEC, enemy.floor));
+    if (rand() < 0.12) this.drop_pickup(room, enemy.x, enemy.y);
+  }
+
+  enemy_explode(x, y) {
+    const radius = 30;
+    this.explosions.push(new Explosion(x, y, radius));
+    if (circle_rect_collision(x, y, radius, this.player.rect)) this.hurt_player(1);
+    for (const other of this.room.enemies.slice()) {
+      if (other.is_boss) continue;
+      if (circle_rect_collision(x, y, radius, other.rect)) {
+        other.health -= 2; other.flash = 5;
+        if (other.health <= 0) this.kill_enemy(other);
+      }
+    }
+  }
+
+  charge_active(amount) {
+    const p = this.player;
+    if (p.active) p.active_charge = Math.min(ITEMS[p.active].charges, p.active_charge + amount);
+  }
+
+  on_room_cleared(room) {
+    if (room.rewarded) return;
+    room.rewarded = true;
+    const cx = ROOM.centerx, cy = ROOM.centery;
+    if (room.role === "boss") {
+      this.charge_active(2);
+      this.drop_coins(room, cx, cy + 20, ri(4, 6));
+      room.items.push(new Item(cx - 26, cy, this.random_item()));
+      room.hatch = new Rect(cx + 14, cy - 10, 20, 20);
+      this.show_banner("BOSS DERROTADO!", "Pegue a melhoria, visite o demonio/anjo ou desca", 200);
+    } else if (room.mini_boss) {
+      this.charge_active(2);
+      this.drop_coins(room, cx, cy, 3);
+      this.drop_pickup(room, cx, cy, "heart");
+      for (let i = 0; i < 2; i++) this.drop_pickup(room, cx, cy);
+      if (room.bonus_key) this.drop_pickup(room, cx, cy, "key");
+      this.show_banner("MINI BOSS DERROTADO!", "Recompensas no chao", 150);
+    } else {
+      this.charge_active(1);
+      this.drop_coins(room, cx, cy, choice([0, 1, 1, 2]));
+      if (room.bonus_key) this.drop_pickup(room, cx, cy, "key");
+      else if (rand() < 0.3) this.drop_pickup(room, cx, cy);
+    }
+  }
+
+  place_bomb() {
+    const p = this.player;
+    if (p.bombs <= 0 || this.game_over) return;
+    p.bombs--;
+    this.bombs.push(new Bomb(p.x, p.y));
+  }
+
+  use_active() {
+    const p = this.player, room = this.room;
+    if (this.game_over || !p.active) return;
+    const data = ITEMS[p.active];
+    if (p.active_charge < data.charges) {
+      this.show_banner("SEM CARGA", `Limpe salas para recarregar (${p.active_charge}/${data.charges})`, 70, true);
+      return;
+    }
+    const effect = data.effect;
+    if (effect === "bombs") {
+      for (let i = 0; i < 6; i++) {
+        const a = PI2 * i / 6 + uniform(-0.2, 0.2);
+        const bx = clamp(p.x + Math.cos(a) * 52, ROOM.left + 10, ROOM.right - 10);
+        const by = clamp(p.y + Math.sin(a) * 52, ROOM.top + 10, ROOM.bottom - 10);
+        if (Math.hypot(bx - p.x, by - p.y) < BOMB_RADIUS + 12) continue;
+        const bomb = new Bomb(bx, by);
+        bomb.fuse = 25 + i * 7;
+        this.bombs.push(bomb);
+      }
+      this.show_banner("CHUVA DE BOMBAS", "", 60);
+    } else if (effect === "keys") {
+      const locked = [...this.rooms.values()].filter(r => r.locked);
+      const golds = room.chests.filter(c => c.kind === "gold" && !c.opened);
+      if (!locked.length && !golds.length) {
+        this.show_banner("CHAVE MESTRA", "Nada trancado por aqui", 80, true);
+        return;
+      }
+      for (const r of locked) r.locked = false;
+      for (const chest of golds) this.open_chest(room, chest);
+      this.show_banner("CHAVE MESTRA", "Portas e baus destrancados", 90);
+    } else if (effect === "fury") {
+      p.fury = 600;
+      this.show_banner("FURIA!", "Dano x2 por 10 segundos", 80);
+    } else if (effect === "shield") {
+      p.shield = 300;
+      this.show_banner("ESCUDO ARCANO", "Invulneravel por 5 segundos", 80);
+    } else if (effect === "blast") {
+      this.explosions.push(new Explosion(p.x, p.y, 110));
+      for (const enemy of room.enemies.slice()) {
+        enemy.health -= 6; enemy.flash = 5;
+        if (enemy.health <= 0) this.kill_enemy(enemy);
+      }
+      this.bullets = [];
+    }
+    p.active_charge = 0;
+  }
+
+  explode(bomb) {
+    const room = this.room, p = this.player;
+    const bx = bomb.x, by = bomb.y;
+    for (const enemy of room.enemies.slice()) {
+      if (circle_rect_collision(bx, by, BOMB_RADIUS, enemy.rect)) {
+        enemy.health -= p.bomb_damage; enemy.flash = 5;
+        if (enemy.health <= 0) this.kill_enemy(enemy);
+      }
+    }
+    room.rocks = room.rocks.filter(r => !circle_rect_collision(bx, by, BOMB_RADIUS, r));
+    this.bullets = this.bullets.filter(b => (b.x - bx) ** 2 + (b.y - by) ** 2 > BOMB_RADIUS ** 2);
+    if (circle_rect_collision(bx, by, BOMB_RADIUS, p.rect)) this.hurt_player(2);
+    this.explosions.push(new Explosion(bx, by));
+    this.reveal_secret_walls(room, bx, by);
+  }
+
+  reveal_secret_walls(room, bx, by) {
+    for (const [direction, target_pos] of Object.entries(room.hidden)) {
+      if (circle_rect_collision(bx, by, BOMB_RADIUS, door_trigger(direction).inflate(20, 20))) {
+        const target = this.rooms.get(target_pos);
+        room.neighbors[direction] = target_pos;
+        target.neighbors[OPPOSITE[direction]] = room.position;
+        room.secret_doors.add(direction);
+        target.secret_doors.add(OPPOSITE[direction]);
+        delete room.hidden[direction];
+        this.show_banner("PAREDE QUEBRADA!", "Uma passagem secreta se abriu", 130);
+      }
+    }
+  }
+
+  open_chest(room, chest) {
+    chest.opened = true;
+    if (chest.kind === "gold") {
+      const ix = clamp(chest.x, ROOM.left + 14, ROOM.right - 14);
+      const iy = clamp(chest.y + 18, ROOM.top + 14, ROOM.bottom - 14);
+      room.items.push(new Item(ix, iy, this.random_item()));
+    } else {
+      const n = ri(2, 3);
+      for (let i = 0; i < n; i++) this.drop_pickup(room, chest.x, chest.y);
+    }
+  }
+
+  collect_item(room, item) {
+    const p = this.player;
+    const data = ITEMS[item.item_id];
+    room.items = room.items.filter(i => i !== item && !(item.group && i.group === item.group));
+    const kind = data.consumable;
+    if (kind) {
+      if (kind === "heart") p.hp = Math.min(p.max_hp, p.hp + 2);
+      else if (kind === "bomb") p.bombs = Math.min(99, p.bombs + 3);
+      else p.keys = Math.min(99, p.keys + 1);
+      this.show_banner(data.name, data.desc, 70);
+      return;
+    }
+    if (data.active) {
+      if (p.active) {
+        const old = new Item(item.x, item.y, p.active);
+        old.armed = false;
+        room.items.push(old);
+      }
+      p.active = item.item_id;
+      p.active_charge = data.charges;
+      this.show_banner(data.name, "ATIVO: aperte Q ou SHIFT - " + data.desc.slice(4), 190);
+    } else {
+      apply_item(p, item.item_id);
+      let sub = data.desc;
+      if (item.cost) sub = `Pacto selado: -${Math.floor(item.cost / 2)} coracao de vida maxima`;
+      this.show_banner(data.name, sub, 170);
+    }
+  }
+
+  try_change_room(direction) {
+    const target = this.rooms.get(this.room.neighbors[direction]);
+    if (target.locked) {
+      if (this.player.keys <= 0) {
+        this.show_banner("PORTA TRANCADA", "Voce precisa de uma chave", 90, true);
+        return;
+      }
+      this.player.keys--;
+      target.locked = false;
+      this.show_banner("PORTA DESTRANCADA", "", 60);
+    }
+    this.room = target;
+    [this.player.x, this.player.y] = entry_position(direction);
+    this.lasers = []; this.rings = []; this.tears = []; this.bullets = []; this.bombs = []; this.explosions = [];
+    target.enter(this);
+  }
+
+  update(keys) {
+    const p = this.player, room = this.room;
+    if (p.invuln > 0) p.invuln--;
+    if (p.fury > 0) p.fury--;
+    if (p.shield > 0) p.shield--;
+    if (this.banner) { this.banner[2]--; if (this.banner[2] <= 0) this.banner = null; }
+
+    p.move(keys, room.rocks);
+    this.update_shooting(keys);
+    this.update_tears();
+    this.update_lasers();
+    this.update_rings();
+    this.update_bullets();
+
+    for (const enemy of room.enemies.slice()) {
+      if (!room.enemies.includes(enemy)) continue;
+      enemy.update(p, room.rocks, room.enemies, this.bullets);
+      const damage = enemy.tick_status();
+      if (damage) {
+        enemy.health -= damage;
+        enemy.flash = 1;
+        if (enemy.health <= 0) { this.kill_enemy(enemy); continue; }
+      }
+      if (enemy.rect.colliderect(p.rect)) this.hurt_player(enemy.damage);
+    }
+
+    for (const bomb of this.bombs.slice()) {
+      bomb.fuse--;
+      if (bomb.fuse <= 0) { this.bombs.splice(this.bombs.indexOf(bomb), 1); this.explode(bomb); }
+    }
+    for (const ex of this.explosions.slice()) {
+      ex.life--;
+      if (ex.life <= 0) this.explosions.splice(this.explosions.indexOf(ex), 1);
+    }
+
+    this.update_interactions();
+
+    const was_cleared = room.cleared;
+    room.update();
+    if (room.cleared && !was_cleared) this.on_room_cleared(room);
+
+    if (this.room === room && room.cleared && !this.game_over) {
+      for (const direction of Object.keys(room.neighbors)) {
+        if (p.rect.colliderect(door_trigger(direction))) { this.try_change_room(direction); break; }
+      }
+    }
+  }
+
+  update_shooting(keys) {
+    const p = this.player;
+    const aim_x = (keys.ArrowRight ? 1 : 0) - (keys.ArrowLeft ? 1 : 0);
+    const aim_y = (keys.ArrowDown ? 1 : 0) - (keys.ArrowUp ? 1 : 0);
+    this.shoot_timer = Math.max(0, this.shoot_timer - 1);
+    const aiming = !!(aim_x || aim_y);
+    if (aiming) this.aim_angle = Math.atan2(aim_y, aim_x);
+    const base = this.aim_angle;
+    const fx = new Set(p.tear_fx);
+    const damage = p.damage * p.damage_mult;
+
+    if (p.weapon === "brimstone" || p.weapon === "techx") {
+      // Armas de carga: segurar o tiro carrega; soltar com a carga cheia dispara.
+      if (aiming) {
+        if (this.shoot_timer === 0) p.brim_charge = Math.min(p.brim_need, p.brim_charge + 1);
+      } else {
+        if (p.brim_charge >= p.brim_need) {
+          if (p.weapon === "brimstone") {
+            // Tiro duplo/triplo: lasers paralelos, todos em linha reta.
+            for (const off of LASER_OFFSETS[p.shots]) {
+              const laser = new Laser(base, damage, fx, off);
+              laser.refresh(p.x, p.y, this.room.enemies);
+              this.lasers.push(laser);
+            }
+          } else {
+            // Tech X: aneis carregados (maiores); tiro duplo/triplo abre em leque.
+            for (const off of SPREADS[p.shots]) {
+              const a = base + off;
+              this.rings.push(new TechRing(p.x, p.y, Math.cos(a), Math.sin(a), damage,
+                p.tear_speed * 0.5, Math.trunc(p.tear_life * 0.8), fx, 3));
+            }
+          }
+          this.shoot_timer = 24;
+        }
+        p.brim_charge = 0;
+      }
+      return;
+    }
+
+    if (!aiming || this.shoot_timer > 0) return;
+
+    for (const off of SPREADS[p.shots]) {
+      const a = base + off;
+      const tear = new Tear(p.x, p.y, Math.cos(a), Math.sin(a), damage, p.tear_speed, p.tear_life, fx);
+      tear.radius = Math.min(6, 3 + Math.floor(damage / 3));
+      this.tears.push(tear);
+    }
+    this.shoot_timer = p.cooldown;
+  }
+
+  update_lasers() {
+    const p = this.player, room = this.room;
+    for (const laser of this.lasers.slice()) {
+      laser.life--;
+      if (laser.life <= 0) { this.lasers.splice(this.lasers.indexOf(laser), 1); continue; }
+      laser.refresh(p.x, p.y, room.enemies);
+      if (laser.life % 3 === 0) {
+        for (const enemy of room.enemies.slice()) {
+          if (!room.enemies.includes(enemy)) continue;
+          const box = enemy.rect.inflate(laser.width, laser.width);
+          if (laser.segments().some(([a, b]) => box.clipline(a, b))) this.hit_enemy(enemy, laser.damage * 0.9, laser.fx);
+        }
+      }
+    }
+  }
+
+  update_rings() {
+    const room = this.room;
+    const bounds = ROOM.inflate(-5, -5);
+    for (const ring of this.rings.slice()) {
+      ring.update(room.enemies);
+      if (ring.life <= 0) { this.rings.splice(this.rings.indexOf(ring), 1); continue; }
+      if (!bounds.collidepoint(ring.x, ring.y)) {
+        if (ring.fx.has("bounce") && ring.bounces < 3) {
+          if (ring.x < bounds.left || ring.x > bounds.right) ring.dx = -ring.dx;
+          if (ring.y < bounds.top || ring.y > bounds.bottom) ring.dy = -ring.dy;
+          ring.x = clamp(ring.x, bounds.left + 1, bounds.right - 1);
+          ring.y = clamp(ring.y, bounds.top + 1, bounds.bottom - 1);
+          ring.bounces++;
+        } else { this.rings.splice(this.rings.indexOf(ring), 1); continue; }
+      }
+      if (ring.age % 3 === 0) {
+        for (const enemy of room.enemies.slice()) {
+          if (room.enemies.includes(enemy) && ring.hits(enemy.rect)) this.hit_enemy(enemy, ring.damage * 0.9, ring.fx);
+        }
+      }
+    }
+  }
+
+  update_tears() {
+    const room = this.room;
+    const bounds = ROOM.inflate(-5, -5);
+    for (const tear of this.tears.slice()) {
+      tear.update(room.enemies);
+      if (tear.life <= 0 || room.rocks.some(r => r.collidepoint(tear.x, tear.y))) {
+        this.tears.splice(this.tears.indexOf(tear), 1); continue;
+      }
+      if (!bounds.collidepoint(tear.x, tear.y)) {
+        if (tear.fx.has("bounce") && tear.bounces < 3) {
+          if (tear.x < bounds.left || tear.x > bounds.right) tear.dx = -tear.dx;
+          if (tear.y < bounds.top || tear.y > bounds.bottom) tear.dy = -tear.dy;
+          tear.x = clamp(tear.x, bounds.left + 1, bounds.right - 1);
+          tear.y = clamp(tear.y, bounds.top + 1, bounds.bottom - 1);
+          tear.bounces++;
+        } else { this.tears.splice(this.tears.indexOf(tear), 1); continue; }
+      }
+      const pierce = tear.fx.has("pierce");
+      for (const enemy of room.enemies.slice()) {
+        if (tear.hit.has(enemy)) continue;
+        if (circle_rect_collision(tear.x, tear.y, tear.radius, enemy.rect)) {
+          tear.hit.add(enemy);
+          enemy.health -= tear.damage;
+          enemy.flash = 5;
+          enemy.apply_fx(tear.fx);
+          if (enemy.health <= 0) this.kill_enemy(enemy);
+          if (!pierce) { this.tears.splice(this.tears.indexOf(tear), 1); break; }
+        }
+      }
+    }
+  }
+
+  update_bullets() {
+    const room = this.room, p = this.player;
+    const bounds = ROOM.inflate(-5, -5);
+    for (const bullet of this.bullets.slice()) {
+      bullet.update();
+      if (bullet.life <= 0 || !bounds.collidepoint(bullet.x, bullet.y)
+          || room.rocks.some(r => r.collidepoint(bullet.x, bullet.y))) {
+        const i = this.bullets.indexOf(bullet); if (i >= 0) this.bullets.splice(i, 1);
+      } else if (circle_rect_collision(bullet.x, bullet.y, bullet.radius, p.rect)) {
+        const i = this.bullets.indexOf(bullet); if (i >= 0) this.bullets.splice(i, 1);
+        this.hurt_player(1);
+      }
+    }
+  }
+
+  update_interactions() {
+    const p = this.player, room = this.room;
+    const pr = p.rect;
+
+    for (const pickup of room.pickups.slice()) {
+      if (!pr.colliderect(pickup.rect)) continue;
+      const remove = () => room.pickups.splice(room.pickups.indexOf(pickup), 1);
+      if (pickup.kind === "heart") {
+        if (p.hp < p.max_hp) { p.hp = Math.min(p.max_hp, p.hp + 2); remove(); }
+      } else if (pickup.kind === "bomb") { p.bombs = Math.min(99, p.bombs + 1); remove(); }
+      else if (pickup.kind === "coin") { p.coins = Math.min(99, p.coins + 1); remove(); }
+      else { p.keys = Math.min(99, p.keys + 1); remove(); }
+    }
+
+    for (const item of room.items.slice()) {
+      if (!room.items.includes(item)) continue;
+      item.near = pr.inflate(70, 70).colliderect(item.rect);
+      const touching = pr.colliderect(item.rect);
+      if (!item.armed) { if (!touching) item.armed = true; continue; }
+      if (!touching) continue;
+      if (item.price) {
+        if (ITEMS[item.item_id].consumable === "heart" && p.hp >= p.max_hp) {
+          this.show_banner("VIDA CHEIA", "Voce nao precisa de um coracao agora", 90, true);
+          continue;
+        }
+        if (p.coins < item.price) {
+          this.show_banner("MOEDAS INSUFICIENTES", `Custa ${item.price} moedas`, 90, true);
+          continue;
+        }
+        p.coins -= item.price;
+      }
+      if (item.cost) {
+        if (p.max_hp - item.cost < MIN_MAX_HP) {
+          this.show_banner("VIDA INSUFICIENTE", "Esse pacto te custaria a vida", 90, true);
+          continue;
+        }
+        p.max_hp -= item.cost;
+        p.hp = Math.min(p.hp, p.max_hp);
+      }
+      this.collect_item(room, item);
+    }
+
+    for (const chest of room.chests) {
+      if (chest.opened || !pr.inflate(4, 4).colliderect(chest.rect)) continue;
+      if (chest.kind === "gold") {
+        if (p.keys > 0) { p.keys--; this.open_chest(room, chest); }
+        else this.show_banner("BAU DOURADO", "Precisa de uma chave", 90, true);
+      } else this.open_chest(room, chest);
+    }
+
+    if (room.hatch && pr.colliderect(room.hatch)) this.next_floor();
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Desenho
+// ----------------------------------------------------------------------------
+const PAUSE_RECT = new Rect(VW / 2 - 7, 4, 14, 14);
+
+function draw_room(room, rooms) {
+  frect(ACTIVE_STAGE.bg, 0, 0, VW, VH);
+  frect(room.floor_color, ROOM.x, ROOM.y, ROOM.w, ROOM.h);
+
+  const speck = mix(room.floor_color, [255, 255, 255], 0.06);
+  for (let y = ROOM.top + 8; y < ROOM.bottom - 4; y += 16)
+    for (let x = ROOM.left + 8; x < ROOM.right - 4; x += 16)
+      if ((Math.floor(x / 16) + Math.floor(y / 16)) % 3 === 0) frect(speck, x, y, 2, 2);
+
+  const edge = { devil: COLORS.devil_edge, angel: COLORS.angel_edge, shop: COLORS.shop_edge }[room.role] || ACTIVE_STAGE.edge;
+  orect(edge, ROOM.x, ROOM.y, ROOM.w, ROOM.h, 3);
+  const inner = ROOM.inflate(-6, -6);
+  orect(COLORS.wall, inner.x, inner.y, inner.w, inner.h, 2);
+
+  for (const rock of room.rocks) {
+    frect(ACTIVE_STAGE.rock_dark, rock.x, rock.y + 2, rock.w, rock.h);
+    frect(ACTIVE_STAGE.rock, rock.x, rock.y, rock.w, rock.h);
+    frect(ACTIVE_STAGE.rock_light, rock.x + 2, rock.y + 2, rock.w - 6, 3);
+  }
+
+  for (const [direction, target_pos] of Object.entries(room.neighbors)) {
+    const rect = door_trigger(direction);
+    if (!room.cleared) {
+      frect(COLORS.door_closed, rect.x, rect.y, rect.w, rect.h);
+      if (direction === "N" || direction === "S") {
+        for (let bx = rect.left + 3; bx < rect.right - 2; bx += 6) frect(COLORS.door_bar, bx, rect.top, 2, rect.h);
+      } else {
+        for (let by = rect.top + 3; by < rect.bottom - 2; by += 6) frect(COLORS.door_bar, rect.left, by, rect.w, 2);
+      }
+    } else if (rooms.get(target_pos).locked) {
+      frect(COLORS.door_locked, rect.x, rect.y, rect.w, rect.h);
+      frect(COLORS.panel, rect.centerx - 2, rect.centery - 2, 4, 4);
+    } else {
+      const target_role = rooms.get(target_pos).role;
+      const special = { devil: COLORS.door_devil, angel: COLORS.door_angel, shop: COLORS.door_shop }[target_role];
+      if (special) {
+        frect(special, rect.x, rect.y, rect.w, rect.h);
+        frect(COLORS.panel, rect.x + 3, rect.y + 3, rect.w - 6, rect.h - 6);
+      } else frect(COLORS.door_open, rect.x, rect.y, rect.w, rect.h);
+      if (room.secret_doors.has(direction)) orect(COLORS.secret_edge, rect.x, rect.y, rect.w, rect.h, 1);
+    }
+  }
+
+  if (room.hatch) {
+    const h = room.hatch;
+    frect(COLORS.rock_dark, h.x - 2, h.y - 2, h.w + 4, h.h + 4);
+    frect(COLORS.panel, h.x, h.y, h.w, h.h);
+    for (let i = 0; i < 4; i++) frect(COLORS.rock_light, h.x + 2 + i, h.y + 2 + i * 4, h.w - 4 - i * 2, 2);
+  }
+}
+
+function draw_hud(game) {
+  const player = game.player, room = game.room;
+  T("VIDA", F_SMALL, COLORS.white, ROOM.left + 3, 6);
+  for (let i = 0; i < Math.floor(player.max_hp / 2); i++) {
+    const x = ROOM.left + 31 + i * 13;
+    const full = player.hp >= (i + 1) * 2;
+    const half = player.hp === i * 2 + 1;
+    frect(full ? COLORS.red : COLORS.dark_red, x, 7, 10, 8);
+    if (half) frect(COLORS.red, x, 7, 5, 8);
+    if (full || half) frect(COLORS.white, x + 2, 8, 2, 2);
+  }
+  draw_key_icon(148, 6);
+  T("x" + player.keys, F_SMALL, COLORS.white, 161, 6);
+  draw_bomb_icon(184, 5);
+  T("x" + player.bombs, F_SMALL, COLORS.white, 196, 6);
+
+  draw_coin_icon(ROOM.left + 3, 15);
+  T("x" + player.coins, F_SMALL, COLORS.gold, ROOM.left + 15, 16);
+
+  frect(COLORS.panel, PAUSE_RECT.x, PAUSE_RECT.y, PAUSE_RECT.w, PAUSE_RECT.h);
+  orect(COLORS.wall_edge, PAUSE_RECT.x, PAUSE_RECT.y, PAUSE_RECT.w, PAUSE_RECT.h, 1);
+  frect(COLORS.white, PAUSE_RECT.x + 4, PAUSE_RECT.y + 3, 2, 8);
+  frect(COLORS.white, PAUSE_RECT.x + 8, PAUSE_RECT.y + 3, 2, 8);
+
+  T("ANDAR " + game.floor, F_SMALL, COLORS.grey, 262, 6);
+  T(ACTIVE_STAGE.name, F_SMALL, COLORS.dim, 262, 15);
+
+  if (room.cleared) T("PORTAS ABERTAS", F_SMALL, COLORS.gold, ROOM.right - 3, 6, "tr");
+  else T("INIMIGOS: " + room.enemies.length, F_SMALL, COLORS.white, ROOM.right - 3, 6, "tr");
+
+  if (player.active) {
+    const data = ITEMS[player.active];
+    const ready = player.active_charge >= data.charges;
+    const ix = ROOM.left + 3, iy = 299;
+    frect(ready ? COLORS.gold : COLORS.panel, ix - 1, iy - 1, 14, 14);
+    frect(ready ? data.color : mix(data.color, COLORS.panel, 0.65), ix, iy, 12, 12);
+    T(data.glyph, F_SMALL, COLORS.panel, ix + 6, iy + 6, "c");
+    for (let i = 0; i < data.charges; i++)
+      frect(i < player.active_charge ? COLORS.gold : COLORS.dark_red, ROOM.left + 19 + i * 6, 308, 4, 4);
+    T("Q", F_SMALL, ready ? COLORS.white : COLORS.grey, ROOM.left + 19, 298);
+  }
+
+  for (const enemy of room.enemies) {
+    if (enemy.is_boss) {
+      T(enemy.name, F_SMALL, COLORS.white, ROOM.left + 62, 305);
+      frect(COLORS.dark_red, 195, 306, 150, 6);
+      frect(COLORS.red, 195, 306, Math.trunc(150 * Math.max(0, enemy.health) / enemy.max_health), 6);
+      orect(COLORS.wall_edge, 195, 306, 150, 6, 1);
+      break;
+    }
+  }
+
+  player.items.slice(0, 14).forEach((item_id, i) => frect(ITEMS[item_id].color, ROOM.right - 7 * (i + 1), 306, 5, 5));
+}
+
+function draw_minimap(game) {
+  const x0 = ROOM.right - 53, y0 = ROOM.top + 3;
+  falpha(COLORS.panel, 150 / 255, x0 - 1, y0 - 1, 51, 37);
+
+  let seen = new Set();
+  for (const [pos, room] of game.rooms) {
+    if (room.visited) { seen.add(pos); for (const n of Object.values(room.neighbors)) seen.add(n); }
+  }
+  if (game.player.map_reveal) seen = new Set(game.rooms.keys());
+
+  const marker_colors = { boss: COLORS.red, treasure: COLORS.gold, secret: COLORS.secret_edge,
+    super: [255, 120, 200], devil: [235, 40, 55], angel: [190, 225, 255], shop: [90, 220, 110] };
+  for (const pos of seen) {
+    const room = game.rooms.get(pos);
+    const [px, py] = P(pos);
+    const rx = x0 + (px + 3) * 7, ry = y0 + (py + 3) * 5;
+    let color;
+    if (pos === game.room.position) color = COLORS.white;
+    else if (room.visited) color = COLORS.grey;
+    else if (room.role === "secret") color = [80, 50, 110];
+    else if (room.role === "super") color = [110, 50, 90];
+    else color = COLORS.dim;
+    frect(color, rx, ry, 6, 4);
+    const marker = marker_colors[room.role];
+    if (marker) frect(marker, rx + 2, ry + 1, 2, 2);
+  }
+}
+
+const STATS_PANEL_W = 98;
+const WEAPON_NAMES = { tear: "LAGRIMA", brimstone: "BRIMSTONE", techx: "TECH X" };
+const FX_NAMES = { fire: "FOGO", ice: "GELO", poison: "VENENO", pierce: "PERFURANTE", homing: "TELEGUIADO", bounce: "SALTITANTE" };
+
+function stats_tab_rect(is_open) { return new Rect(is_open ? STATS_PANEL_W : 0, 130, 11, 46); }
+
+function fire_rate(player) {
+  if (player.weapon === "brimstone" || player.weapon === "techx") return 60 / (player.brim_need + 24);
+  return 60 / Math.max(1, player.cooldown);
+}
+
+function draw_stats_panel(game, is_open) {
+  const p = game.player;
+  const tab = stats_tab_rect(is_open);
+  if (is_open) {
+    const top = 22, height = 296;
+    falpha(COLORS.panel, 225 / 255, 0, top, STATS_PANEL_W, height);
+    orect(COLORS.wall_edge, 0, top, STATS_PANEL_W, height, 1);
+
+    let y = top + 5;
+    T("STATUS", F_SMALL, COLORS.gold, STATS_PANEL_W / 2, y, "tc");
+    y += 11;
+    line(COLORS.wall_edge, [4, y + 0.5], [STATS_PANEL_W - 5, y + 0.5]);
+    y += 4;
+
+    const damage = p.damage * p.damage_mult;
+    const rows = [
+      ["VIDA", `${p.hp / 2}/${p.max_hp / 2}`, COLORS.red],
+      ["DANO", damage.toFixed(1), p.fury > 0 ? [255, 140, 70] : COLORS.white],
+      ["CADENCIA", fire_rate(p).toFixed(1) + "/s", COLORS.white],
+      ["ALCANCE", (p.tear_life * p.tear_speed / 80).toFixed(1), COLORS.white],
+      ["VEL. TIRO", (p.tear_speed / TEAR_SPEED).toFixed(2), COLORS.white],
+      ["VELOCIDADE", (p.speed / PLAYER_SPEED).toFixed(2), COLORS.white],
+      ["TIROS", String(p.shots), COLORS.white],
+      ["INVULN.", (p.invuln_frames / 60).toFixed(1) + "s", COLORS.white],
+      ["BOMBA", String(p.bomb_damage), COLORS.white],
+      ["MOEDAS", String(p.coins), COLORS.gold],
+      ["ARMA", WEAPON_NAMES[p.weapon] || p.weapon.toUpperCase(), COLORS.gold],
+    ];
+    for (const [label, value, color] of rows) {
+      T(label, F_SMALL, COLORS.grey, 5, y);
+      T(value, F_SMALL, color, STATS_PANEL_W - 5, y, "tr");
+      y += 10;
+    }
+
+    y += 3;
+    T("EFEITOS", F_SMALL, COLORS.grey, 5, y); y += 10;
+    const effects = Object.keys(FX_NAMES).filter(f => p.tear_fx.has(f));
+    if (!effects.length) { T("-", F_SMALL, COLORS.dim, 9, y); y += 10; }
+    for (const fx of effects) { T(FX_NAMES[fx], F_SMALL, FX_COLORS[fx], 9, y); y += 10; }
+
+    y += 3;
+    T("ATIVO", F_SMALL, COLORS.grey, 5, y); y += 10;
+    if (p.active) {
+      const data = ITEMS[p.active];
+      T(data.name, F_SMALL, data.color, 9, y); y += 10;
+      T(`cargas ${p.active_charge}/${data.charges}`, F_SMALL, COLORS.white, 9, y); y += 10;
+    } else { T("-", F_SMALL, COLORS.dim, 9, y); y += 10; }
+
+    y += 3;
+    T(`ITENS (${p.items.length})`, F_SMALL, COLORS.grey, 5, y); y += 11;
+    p.items.slice(0, 21).forEach((item_id, i) => {
+      const rx = 5 + (i % 7) * 13, ry = y + Math.floor(i / 7) * 13;
+      frect(ITEMS[item_id].color, rx, ry, 11, 11);
+      T(ITEMS[item_id].glyph, F_SMALL, COLORS.panel, rx + 5.5, ry + 5.5, "c");
+    });
+  }
+
+  frect(COLORS.panel, tab.x, tab.y, tab.w, tab.h);
+  orect(COLORS.wall_edge, tab.x, tab.y, tab.w, tab.h, 1);
+  g.save();
+  g.translate(tab.centerx, tab.centery);
+  g.rotate(-Math.PI / 2);
+  T("STATUS", F_SMALL, COLORS.gold, 0, 0, "c");
+  g.restore();
+}
+
+function draw_banner(banner) {
+  const [title, sub] = banner;
+  const tW = tw(title, F_HINT), sW = sub ? tw(sub, F_SMALL) : 0;
+  const w = Math.max(tW, sW) + 14, h = sub ? 24 : 16;
+  falpha(COLORS.panel, 190 / 255, VW / 2 - w / 2, ROOM.top + 8, w, h);
+  T(title, F_HINT, COLORS.gold, VW / 2, ROOM.top + 10, "tc");
+  if (sub) T(sub, F_SMALL, COLORS.white, VW / 2, ROOM.top + 22, "tc");
+}
+
+function draw_game_over(game) {
+  falpha(COLORS.panel, 190 / 255, 0, 0, VW, VH);
+  T("VOCE MORREU", F_BIG, COLORS.white, VW / 2, VH / 2 - 20, "c");
+  T(`Voce chegou ao andar ${game.floor}`, F_HINT, COLORS.grey, VW / 2, VH / 2 + 4, "c");
+  T("Segure R por 1 segundo para tentar novamente", F_HINT, COLORS.gold, VW / 2, VH / 2 + 22, "c");
+}
+
+function pause_menu_buttons() {
+  const cx = VW / 2;
+  return [["CONTINUAR", "resume"], ["REINICIAR", "restart"], ["SAIR", "quit"]]
+    .map(([label, action], i) => [label, new Rect(cx - 55, 120 + i * 24, 110, 18), action]);
+}
+
+function draw_pause(mouse) {
+  falpha(COLORS.panel, 200 / 255, 0, 0, VW, VH);
+  T("PAUSADO", F_BIG, COLORS.white, VW / 2, 95, "c");
+  for (const [label, rect, _a] of pause_menu_buttons()) {
+    const hover = rect.collidepoint(mouse[0], mouse[1]);
+    frect(hover ? COLORS.wall_edge : COLORS.panel, rect.x, rect.y, rect.w, rect.h);
+    orect(COLORS.wall_edge, rect.x, rect.y, rect.w, rect.h, 1);
+    T(label, F_HINT, hover ? COLORS.gold : COLORS.white, rect.centerx, rect.centery, "c");
+  }
+  T("P / ESC: continuar    Segure R: reiniciar", F_SMALL, COLORS.grey, VW / 2, 205, "c");
+}
+
+function draw_restart_bar(progress) {
+  const w = 120, h = 8, x = VW / 2 - w / 2, y = VH / 2 + 48;
+  T("REINICIANDO...", F_SMALL, COLORS.white, VW / 2, y - 8, "c");
+  frect(COLORS.panel, x - 1, y - 1, w + 2, h + 2);
+  frect(COLORS.gold, x, y, Math.trunc(w * clamp(progress, 0, 1)), h);
+  orect(COLORS.wall_edge, x - 1, y - 1, w + 2, h + 2, 1);
+}
+
+function render(game, paused, mouse, restart_progress, stats_open) {
+  g = ctx0;
+  g.setTransform(SCALE, 0, 0, SCALE, 0, 0);
+  g.imageSmoothingEnabled = false;
+  const room = game.room;
+  draw_room(room, game.rooms);
+
+  for (const c of room.chests) c.draw();
+  for (const pk of room.pickups) pk.draw();
+  for (const it of room.items) it.draw();
+  for (const b of game.bombs) b.draw();
+  for (const t of game.tears) t.draw();
+  for (const r of game.rings) r.draw();
+  for (const e of room.enemies.slice().sort((a, b) => (a.flying ? 1 : 0) - (b.flying ? 1 : 0))) e.draw();
+  for (const b of game.bullets) b.draw();
+  for (const l of game.lasers) l.draw();
+  game.player.draw();
+  for (const ex of game.explosions) ex.draw();
+
+  draw_hud(game);
+  draw_minimap(game);
+  draw_stats_panel(game, stats_open);
+  if (game.banner) draw_banner(game.banner);
+
+  if (game.game_over) draw_game_over(game);
+  else if (paused) draw_pause(mouse);
+
+  if (restart_progress !== null) draw_restart_bar(restart_progress);
+}
+
+// ----------------------------------------------------------------------------
+// Loop principal
+// ----------------------------------------------------------------------------
+let game = new Game();
+let paused = false, stats_open = false;
+let r_since = null, r_locked = false;
+let mouse = [0, 0];
+const keys = {};
+const BLOCKED = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space", "Tab"]);
+
+function toVirtual(ev) {
+  const r = canvas.getBoundingClientRect();
+  return [(ev.clientX - r.left) / r.width * VW, (ev.clientY - r.top) / r.height * VH];
+}
+
+window.addEventListener("keydown", (ev) => {
+  if (BLOCKED.has(ev.code)) ev.preventDefault();
+  if (ev.repeat) { keys[ev.code] = true; return; }
+  keys[ev.code] = true;
+  const code = ev.code;
+  if (code === "Escape" || code === "KeyP") {
+    if (!game.game_over) paused = !paused;
+  } else if (code === "Tab") {
+    stats_open = !stats_open;
+  } else if (code === "KeyE" || code === "Space") {
+    if (!paused && !game.game_over) game.place_bomb();
+  } else if (code === "KeyQ" || code === "ShiftLeft" || code === "ShiftRight") {
+    if (!paused && !game.game_over) game.use_active();
+  }
+});
+window.addEventListener("keyup", (ev) => { keys[ev.code] = false; });
+window.addEventListener("blur", () => { for (const k of Object.keys(keys)) keys[k] = false; });
+
+canvas.addEventListener("mousemove", (ev) => { mouse = toVirtual(ev); });
+canvas.addEventListener("mousedown", (ev) => {
+  canvas.focus();
+  if (ev.button !== 0) return;
+  const click = toVirtual(ev);
+  mouse = click;
+  if (stats_tab_rect(stats_open).collidepoint(click[0], click[1])) stats_open = !stats_open;
+  else if (!game.game_over && PAUSE_RECT.collidepoint(click[0], click[1])) paused = !paused;
+  else if (paused) {
+    for (const [_l, rect, action] of pause_menu_buttons()) {
+      if (rect.collidepoint(click[0], click[1])) {
+        if (action === "resume") paused = false;
+        else if (action === "restart") { game = new Game(); paused = false; }
+        else { paused = false; game = new Game(); }   // "SAIR": no navegador, volta ao inicio
+      }
+    }
+  }
+});
+
+let last = performance.now(), acc = 0;
+const STEP = 1000 / FPS;
+
+function frame(now) {
+  acc += Math.min(100, now - last);
+  last = now;
+
+  let restart_progress = null;
+  if (keys.KeyR) {
+    if (!r_locked) {
+      if (r_since === null) r_since = now;
+      const held = now - r_since;
+      restart_progress = held / RESTART_HOLD_MS;
+      if (held >= RESTART_HOLD_MS) {
+        game = new Game(); paused = false; r_since = null; r_locked = true; restart_progress = null;
+      }
+    }
+  } else { r_since = null; r_locked = false; }
+
+  while (acc >= STEP) {
+    if (!paused && !game.game_over) game.update(keys);
+    acc -= STEP;
+  }
+  render(game, paused, mouse, restart_progress, stats_open);
+  requestAnimationFrame(frame);
+}
+canvas.focus();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
